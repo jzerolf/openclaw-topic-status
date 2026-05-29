@@ -1,0 +1,96 @@
+{
+  "id": "openclaw-topic-status",
+  "name": "OpenClaw Topic Status",
+  "description": "Updates Telegram forum topic custom emoji icons from OpenClaw message and agent lifecycle hooks.",
+  "activation": {
+    "onStartup": true,
+    "onChannels": ["telegram"],
+    "onCapabilities": ["hook"]
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": {
+        "type": "boolean",
+        "default": true
+      },
+      "channelId": {
+        "type": "string",
+        "default": "telegram"
+      },
+      "apiRoot": {
+        "type": "string",
+        "default": "https://api.telegram.org"
+      },
+      "botTokenEnv": {
+        "type": "string"
+      },
+      "botTokenFile": {
+        "type": "string"
+      },
+      "timeoutMs": {
+        "type": "integer",
+        "minimum": 1000,
+        "maximum": 7200000,
+        "default": 1800000
+      },
+      "timeoutState": {
+        "type": "string",
+        "enum": ["idle", "error", "timeout"],
+        "default": "timeout"
+      },
+      "onlyAccountIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "allowedChatIds": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "observeMessageSent": {
+        "type": "boolean",
+        "default": true
+      },
+      "icons": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "working": {
+            "type": "string"
+          },
+          "idle": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          },
+          "timeout": {
+            "type": "string"
+          },
+          "workingIconCustomEmojiId": {
+            "type": "string"
+          },
+          "idleIconCustomEmojiId": {
+            "type": "string"
+          },
+          "errorIconCustomEmojiId": {
+            "type": "string"
+          },
+          "timeoutIconCustomEmojiId": {
+            "type": "string"
+          }
+        }
+      },
+      "logLevel": {
+        "type": "string",
+        "enum": ["off", "info", "debug"],
+        "default": "info"
+      }
+    }
+  }
+}

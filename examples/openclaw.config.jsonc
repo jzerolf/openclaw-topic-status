@@ -1,0 +1,23 @@
+{
+  "plugins": {
+    "entries": {
+      "openclaw-topic-status": {
+        "enabled": true,
+        "hooks": {
+          "allowConversationAccess": true
+        },
+        "config": {
+          "botTokenFile": "/path/to/telegram.bot_token",
+          "timeoutMs": 1800000,
+          "timeoutState": "timeout",
+          "icons": {
+            "working": "5309832892262654231",
+            "idle": "5357121491508928442",
+            "error": "5312241539987020022",
+            "timeout": "5312241539987020022"
+          }
+        }
+      }
+    }
+  }
+}

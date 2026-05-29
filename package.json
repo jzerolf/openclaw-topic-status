@@ -1,0 +1,59 @@
+{
+  "name": "openclaw-topic-status",
+  "version": "0.1.0",
+  "description": "OpenClaw plugin that updates Telegram forum topic icons based on real agent runtime state.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Juan Carlos Florez",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jzerolf/openclaw-topic-status.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jzerolf/openclaw-topic-status/issues"
+  },
+  "homepage": "https://github.com/jzerolf/openclaw-topic-status#readme",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "telegram",
+    "forum-topics",
+    "custom-emoji",
+    "status"
+  ],
+  "files": [
+    "index.js",
+    "openclaw.plugin.json",
+    "examples/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "check": "node --check index.js && node test/smoke.mjs",
+    "test": "npm run check",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.5.27"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.js"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.5.27",
+      "minGatewayVersion": "2026.5.27"
+    }
+  }
+}
