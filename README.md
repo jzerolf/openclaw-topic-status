@@ -92,6 +92,29 @@ The plugin can read the Telegram bot token from:
 
 Never commit bot tokens to a repo.
 
+## Choosing Topic Icons
+
+Telegram only accepts forum topic icon IDs returned by
+`getForumTopicIconStickers` for the bot/account you are using. You can list
+the available icons with:
+
+```bash
+curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getForumTopicIconStickers" \
+  | jq -r '.result[] | "\(.emoji)\t\(.custom_emoji_id)"'
+```
+
+Known working examples:
+
+| Suggested state | Emoji | `custom_emoji_id` | Why it works well |
+| --- | --- | --- | --- |
+| `working` | 🤖 | `5309832892262654231` | Clear signal that the agent is handling the topic. |
+| `idle` | 👀 | `5357121491508928442` | Quiet "watching/available" state after a clean finish. |
+| `error` | 🔥 | `5312241539987020022` | Visible enough for failed turns or operational attention. |
+| `timeout` | 🔥 | `5312241539987020022` | Reuse the error icon when the runtime did not emit a final event. |
+
+Use those values as examples, then replace them with any
+`custom_emoji_id` returned by your own bot.
+
 ## Configuration Reference
 
 | Key | Type | Default | Notes |
