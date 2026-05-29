@@ -123,8 +123,11 @@ Never commit bot tokens to a repo.
 ## Choosing Topic Icons
 
 Telegram only accepts forum topic icon IDs returned by
-`getForumTopicIconStickers` for the bot/account you are using. You can list
-the available icons with:
+`getForumTopicIconStickers`. These `custom_emoji_id` values are Telegram-wide
+identifiers for the allowed forum topic icon stickers, so the examples below
+should work anywhere while Telegram keeps them in that allowed set.
+
+You can list the current allowed icons with:
 
 ```bash
 curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getForumTopicIconStickers" \
@@ -140,8 +143,8 @@ Known working examples:
 | `error` | 🔥 | `5312241539987020022` | Visible enough for failed turns or operational attention. |
 | `timeout` | 🔥 | `5312241539987020022` | Reuse the error icon when the runtime did not emit a final event. |
 
-Use those values as examples, then replace them with any
-`custom_emoji_id` returned by your own bot.
+Use those values directly, or replace them with any other `custom_emoji_id`
+returned by `getForumTopicIconStickers`.
 
 ## Changing Icons Later
 
