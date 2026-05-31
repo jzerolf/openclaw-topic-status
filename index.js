@@ -564,6 +564,15 @@ function createRuntime(api) {
     applyStatus(state, finalState);
   }
 
+  function onBeforeAgentFinalize(event, ctx) {
+    const state = lookup(event, ctx);
+    if (!state) {
+      return;
+    }
+    log.debug(`before_agent_finalize -> idle ${state.topicKey}`);
+    applyStatus(state, "idle");
+  }
+
   function onSessionEnd(event, ctx) {
     const state = lookup(event, ctx);
     if (!state) {
@@ -604,6 +613,7 @@ function createRuntime(api) {
     onBeforeAgentRun,
     onMessageSent,
     onAgentEnd,
+    onBeforeAgentFinalize,
     onSessionEnd,
     stop,
     _state: { bySession, byRun, byTopic, topicSeq, timeoutByTopic },
@@ -620,6 +630,7 @@ const entry = {
     api.on("message_received", runtime.onMessageReceived, { priority: 10, timeoutMs: 5_000 });
     api.on("before_agent_run", runtime.onBeforeAgentRun, { priority: 10, timeoutMs: 5_000 });
     api.on("message_sent", runtime.onMessageSent, { priority: -10, timeoutMs: 5_000 });
+    api.on("before_agent_finalize", runtime.onBeforeAgentFinalize, { priority: -10, timeoutMs: 5_000 });
     api.on("agent_end", runtime.onAgentEnd, { priority: -10, timeoutMs: 5_000 });
     api.on("session_end", runtime.onSessionEnd, { priority: -10, timeoutMs: 5_000 });
     api.on("gateway_stop", () => runtime.stop(), { priority: 0, timeoutMs: 5_000 });

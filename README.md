@@ -12,7 +12,9 @@ conversation or agent thread.
 
 - Sets a topic icon when a message is received.
 - Keeps the topic marked as active while an agent turn is running.
-- Sets a final idle or error icon when the agent turn ends.
+- Sets a final idle or error icon when the agent turn ends, with a finalize
+  fallback for runtimes that prepare a final reply without a later turn-end
+  hook.
 - Sets a timeout icon if OpenClaw never emits a final lifecycle event or the
   gateway stops while a topic is still active.
 - Avoids treating `message_sent` as "done"; outgoing messages only refresh the
@@ -25,7 +27,7 @@ conversation or agent thread.
 | State | Trigger | Meaning |
 | --- | --- | --- |
 | `working` | `message_received`, `before_agent_run` | A user message arrived or an agent turn is active. |
-| `idle` | `agent_end` with success, clean `session_end` | The agent/session finished cleanly. |
+| `idle` | `before_agent_finalize`, `agent_end` with success, clean `session_end` | The agent/session finished cleanly. |
 | `error` | `agent_end` with failure | The agent turn ended with an error. |
 | `timeout` | rescue timer, restart/shutdown `session_end`, `gateway_stop` | No clean final lifecycle event arrived. |
 
@@ -82,8 +84,8 @@ should do the following:
    or an existing Telegram account token file.
 6. Restart the OpenClaw gateway.
 7. Verify with a real Telegram forum topic: user message should switch to
-   `working`, and `agent_end`/`session_end` should switch to `idle`, `error`,
-   or `timeout`.
+   `working`, and finalization/`agent_end`/`session_end` should switch to
+   `idle`, `error`, or `timeout`.
 
 ## Configure
 
