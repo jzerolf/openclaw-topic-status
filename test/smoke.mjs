@@ -129,7 +129,7 @@ assert.equal(calls.length, 5);
 assert.equal(calls.at(-1).body.message_thread_id, 10002);
 assert.equal(calls.at(-1).body.icon_custom_emoji_id, "idle");
 
-hooks.get("gateway_stop")({}, {});
+await hooks.get("gateway_stop")({}, {});
 
 const isolatedHooks = new Map();
 plugin.register({
@@ -154,7 +154,85 @@ assert.equal(calls.length, 6);
 assert.equal(calls.at(-1).body.message_thread_id, 20003);
 assert.equal(calls.at(-1).body.icon_custom_emoji_id, "idle");
 
-isolatedHooks.get("gateway_stop")({}, {});
+await isolatedHooks.get("gateway_stop")({}, {});
+
+const sessionEndHooks = new Map();
+plugin.register({
+  ...api,
+  on(name, handler) {
+    sessionEndHooks.set(name, handler);
+  },
+});
+
+sessionEndHooks.get("message_received")(
+  {
+    from: "telegram:5966150195",
+    threadId: 25003,
+    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:25003",
+    senderId: "5966150195",
+  },
+  {
+    channelId: "telegram",
+    accountId: "default",
+    conversationId: "telegram:5966150195",
+    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:25003",
+    senderId: "5966150195",
+  },
+);
+
+sessionEndHooks.get("session_end")(
+  {
+    sessionId: "session-25003",
+    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:25003",
+    messageCount: 2,
+    reason: "idle",
+  },
+  {
+    sessionId: "session-25003",
+    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:25003",
+  },
+);
+
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(calls.length, 8);
+assert.equal(calls.at(-1).body.message_thread_id, 25003);
+assert.equal(calls.at(-1).body.icon_custom_emoji_id, "idle");
+
+await sessionEndHooks.get("gateway_stop")({}, {});
+
+const gatewayStopHooks = new Map();
+plugin.register({
+  ...api,
+  on(name, handler) {
+    gatewayStopHooks.set(name, handler);
+  },
+});
+
+gatewayStopHooks.get("message_received")(
+  {
+    from: "telegram:5966150195",
+    threadId: 26003,
+    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:26003",
+    senderId: "5966150195",
+  },
+  {
+    channelId: "telegram",
+    accountId: "default",
+    conversationId: "telegram:5966150195",
+    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:26003",
+    senderId: "5966150195",
+  },
+);
+
+await new Promise((resolve) => setImmediate(resolve));
+assert.equal(calls.length, 9);
+assert.equal(calls.at(-1).body.icon_custom_emoji_id, "working");
+
+await gatewayStopHooks.get("gateway_stop")({}, {});
+
+assert.equal(calls.length, 10);
+assert.equal(calls.at(-1).body.message_thread_id, 26003);
+assert.equal(calls.at(-1).body.icon_custom_emoji_id, "timeout");
 
 const timeoutHooks = new Map();
 plugin.register({
@@ -186,11 +264,11 @@ timeoutHooks.get("message_received")(
 );
 
 await new Promise((resolve) => setTimeout(resolve, 1100));
-assert.equal(calls.length, 8);
+assert.equal(calls.length, 12);
 assert.equal(calls.at(-2).body.icon_custom_emoji_id, "working");
 assert.equal(calls.at(-1).body.message_thread_id, 30004);
 assert.equal(calls.at(-1).body.icon_custom_emoji_id, "timeout");
 
-timeoutHooks.get("gateway_stop")({}, {});
+await timeoutHooks.get("gateway_stop")({}, {});
 delete globalThis.__telegramTopicStatusPostJson;
 fs.rmSync(dir, { recursive: true, force: true });

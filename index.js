@@ -564,12 +564,39 @@ function createRuntime(api) {
     applyStatus(state, finalState);
   }
 
-  function stop() {
+  function onSessionEnd(event, ctx) {
+    const state = lookup(event, ctx);
+    if (!state) {
+      return;
+    }
+    if (event?.reason === "compaction" && (event.nextSessionId || event.nextSessionKey)) {
+      log.debug(`session_end compaction -> keep working ${state.topicKey}`);
+      scheduleRescue(state);
+      return;
+    }
+    const finalState =
+      event?.reason === "shutdown" || event?.reason === "restart" || event?.reason === "unknown"
+        ? config.timeoutState
+        : "idle";
+    log.debug(`session_end -> ${finalState} ${state.topicKey}`);
+    applyStatus(state, finalState);
+  }
+
+  async function stop() {
+    const activeStates = [...byTopic.values()];
     for (const timer of timeoutByTopic.values()) {
       clearTimeout(timer);
     }
     timeoutByTopic.clear();
+    if (activeStates.length > 0) {
+      await Promise.allSettled(
+        activeStates.map((state) => editForumTopicIcon(api, config, log, state, config.timeoutState)),
+      );
+    }
     byTopic.clear();
+    byRun.clear();
+    bySession.clear();
+    latestBySender.clear();
   }
 
   return {
@@ -577,6 +604,7 @@ function createRuntime(api) {
     onBeforeAgentRun,
     onMessageSent,
     onAgentEnd,
+    onSessionEnd,
     stop,
     _state: { bySession, byRun, byTopic, topicSeq, timeoutByTopic },
   };
@@ -593,7 +621,8 @@ const entry = {
     api.on("before_agent_run", runtime.onBeforeAgentRun, { priority: 10, timeoutMs: 5_000 });
     api.on("message_sent", runtime.onMessageSent, { priority: -10, timeoutMs: 5_000 });
     api.on("agent_end", runtime.onAgentEnd, { priority: -10, timeoutMs: 5_000 });
-    api.on("gateway_stop", () => runtime.stop(), { priority: 0, timeoutMs: 2_000 });
+    api.on("session_end", runtime.onSessionEnd, { priority: -10, timeoutMs: 5_000 });
+    api.on("gateway_stop", () => runtime.stop(), { priority: 0, timeoutMs: 5_000 });
   },
 };
 
