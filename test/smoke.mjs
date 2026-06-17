@@ -40,6 +40,7 @@ const api = {
 };
 
 plugin.register(api);
+assert.equal(hooks.has("before_agent_finalize"), false);
 
 hooks.get("message_received")(
   {
@@ -156,52 +157,6 @@ assert.equal(calls.at(-1).body.icon_custom_emoji_id, "idle");
 
 await isolatedHooks.get("gateway_stop")({}, {});
 
-const finalizeHooks = new Map();
-plugin.register({
-  ...api,
-  on(name, handler) {
-    finalizeHooks.set(name, handler);
-  },
-});
-
-finalizeHooks.get("message_received")(
-  {
-    from: "telegram:5966150195",
-    threadId: 24003,
-    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:24003",
-    senderId: "5966150195",
-  },
-  {
-    channelId: "telegram",
-    accountId: "default",
-    conversationId: "telegram:5966150195",
-    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:24003",
-    senderId: "5966150195",
-  },
-);
-
-finalizeHooks.get("before_agent_finalize")(
-  {
-    runId: "run-24003",
-    sessionId: "session-24003",
-    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:24003",
-    stopHookActive: false,
-    lastAssistantMessage: "done",
-  },
-  {
-    runId: "run-24003",
-    sessionId: "session-24003",
-    sessionKey: "agent:main:telegram:direct:5966150195:thread:5966150195:24003",
-  },
-);
-
-await new Promise((resolve) => setImmediate(resolve));
-assert.equal(calls.length, 8);
-assert.equal(calls.at(-1).body.message_thread_id, 24003);
-assert.equal(calls.at(-1).body.icon_custom_emoji_id, "idle");
-
-await finalizeHooks.get("gateway_stop")({}, {});
-
 const sessionEndHooks = new Map();
 plugin.register({
   ...api,
@@ -240,7 +195,7 @@ sessionEndHooks.get("session_end")(
 );
 
 await new Promise((resolve) => setImmediate(resolve));
-assert.equal(calls.length, 10);
+assert.equal(calls.length, 8);
 assert.equal(calls.at(-1).body.message_thread_id, 25003);
 assert.equal(calls.at(-1).body.icon_custom_emoji_id, "idle");
 
@@ -271,12 +226,12 @@ gatewayStopHooks.get("message_received")(
 );
 
 await new Promise((resolve) => setImmediate(resolve));
-assert.equal(calls.length, 11);
+assert.equal(calls.length, 9);
 assert.equal(calls.at(-1).body.icon_custom_emoji_id, "working");
 
 await gatewayStopHooks.get("gateway_stop")({}, {});
 
-assert.equal(calls.length, 12);
+assert.equal(calls.length, 10);
 assert.equal(calls.at(-1).body.message_thread_id, 26003);
 assert.equal(calls.at(-1).body.icon_custom_emoji_id, "timeout");
 
@@ -310,7 +265,7 @@ timeoutHooks.get("message_received")(
 );
 
 await new Promise((resolve) => setTimeout(resolve, 1100));
-assert.equal(calls.length, 14);
+assert.equal(calls.length, 12);
 assert.equal(calls.at(-2).body.icon_custom_emoji_id, "working");
 assert.equal(calls.at(-1).body.message_thread_id, 30004);
 assert.equal(calls.at(-1).body.icon_custom_emoji_id, "timeout");

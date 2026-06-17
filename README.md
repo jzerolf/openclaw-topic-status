@@ -12,9 +12,7 @@ conversation or agent thread.
 
 - Sets a topic icon when a message is received.
 - Keeps the topic marked as active while an agent turn is running.
-- Sets a final idle or error icon when the agent turn ends, with a finalize
-  fallback for runtimes that prepare a final reply without a later turn-end
-  hook.
+- Sets a final idle or error icon when the agent turn or session ends.
 - Sets a timeout icon if OpenClaw never emits a final lifecycle event or the
   gateway stops while a topic is still active.
 - Avoids treating `message_sent` as "done"; outgoing messages only refresh the
@@ -27,12 +25,17 @@ conversation or agent thread.
 | State | Trigger | Meaning |
 | --- | --- | --- |
 | `working` | `message_received`, `before_agent_run` | A user message arrived or an agent turn is active. |
-| `idle` | `before_agent_finalize`, `agent_end` with success, clean `session_end` | The agent/session finished cleanly. |
+| `idle` | `agent_end` with success, clean `session_end` | The agent/session finished cleanly. |
 | `error` | `agent_end` with failure | The agent turn ended with an error. |
 | `timeout` | rescue timer, restart/shutdown `session_end`, `gateway_stop` | No clean final lifecycle event arrived. |
 
 `message_sent` is observed only to refresh the timeout while progress updates
 are delivered. It is not a reliable completion signal.
+
+The plugin intentionally does not use OpenClaw's `before_agent_finalize` hook
+as a completion signal. In Codex-backed runtimes that hook maps to the native
+`Stop` hook and can fire while the agent is preparing an intermediate progress
+message before continuing with tools or more work.
 
 ## Install
 

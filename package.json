@@ -1,6 +1,6 @@
 {
   "name": "openclaw-topic-status",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "OpenClaw plugin that updates Telegram forum topic icons based on real agent runtime state.",
   "type": "module",
   "license": "MIT",
@@ -26,6 +26,7 @@
     "openclaw.plugin.json",
     "examples/",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "engines": {
