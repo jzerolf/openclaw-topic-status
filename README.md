@@ -275,6 +275,9 @@ npm run pack:dry-run
 The smoke test uses an injected fake Telegram API transport, so it does not send
 real Telegram requests.
 
+The planned v0.2 lifecycle and concurrency hardening is documented in
+[docs/reliability-plan-0.2.md](docs/reliability-plan-0.2.md).
+
 ## License
 
 MIT

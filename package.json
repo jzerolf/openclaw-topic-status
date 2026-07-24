@@ -25,6 +25,7 @@
     "index.js",
     "openclaw.plugin.json",
     "examples/",
+    "docs/",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
