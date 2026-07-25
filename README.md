@@ -15,7 +15,8 @@ conversation or agent thread.
 - Tracks overlapping turns by exact OpenClaw `runId` and keeps the topic marked
   as active until every matching run has ended.
 - Sets a final idle or error icon from `agent_end`; stale or ambiguous terminal
-  hooks are ignored.
+  hooks cannot close a known active run. Rebuilt OpenClaw plugin registries can
+  still close the exact Telegram topic carried by the terminal hook.
 - Sets a timeout icon if OpenClaw never emits a final lifecycle event or the
   gateway stops while a topic is still active.
 - Serializes and coalesces Telegram writes per topic, adds bounded transient

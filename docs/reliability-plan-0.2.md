@@ -1,6 +1,7 @@
 # Reliability plan for v0.2
 
-Status: implemented for v0.2.0.
+Status: implemented for v0.2.0, with cross-registration terminal handling
+hardened in v0.2.1.
 
 Reviewed against:
 
@@ -75,14 +76,16 @@ Split the current general-purpose `lookup()` into event-specific resolution:
 - start/resume events may resolve a Telegram target from typed context and
   `sessionKey`;
 - terminal events with a `runId` must match that exact tracked run;
-- if a terminal event supplies an unknown `runId`, ignore it and log a safe
-  diagnostic; do not fall back to the current session, sender, or topic;
+- if a terminal event supplies an unknown `runId` while the resolved topic has
+  a known active run, ignore it and log a safe diagnostic;
+- if OpenClaw rebuilt the plugin registry between lifecycle phases and the
+  resolved topic has no known active run, allow a stateless terminal write only
+  to the exact Telegram topic carried by the hook context;
 - only support a missing-`runId` legacy fallback when the session maps
   unambiguously to one active run. Otherwise leave the topic working and let
   the rescue timeout handle it.
 
-Remove the current behavior that invents an idle transition from an
-`agent_end` received by a fresh plugin runtime with no tracked state.
+Never use sender-wide or cross-topic fallback for this compatibility path.
 
 ### P0: track active runs, not one mutable topic record
 
@@ -251,7 +254,8 @@ At minimum:
 4. Two topics used by the same sender never share state.
 5. Duplicate `message_received`/`before_agent_run` events for one `runId` do
    not duplicate Telegram writes.
-6. An unknown terminal `runId` is ignored.
+6. An unknown terminal `runId` cannot close a known active topic; a rebuilt
+   registry may close only the exact stateless Telegram topic in its context.
 7. A `session_end(idle|compaction|reset)` cannot close a current active run.
 8. Delayed fake HTTP responses cannot reorder the final applied status.
 9. A new run during the idle debounce cancels idle.
@@ -274,8 +278,8 @@ should use the current exact `runId` contract. For v0.2, choose one of:
   correlation fail safe and cover that legacy path with separate tests.
 
 Reliability is more valuable here than preserving broad compatibility with
-older hook behavior. The recommended release target is v0.2.0 because the
-state and lifecycle semantics change materially.
+older hook behavior. The state and lifecycle redesign shipped as v0.2.0; the
+cross-registration terminal fix follows as v0.2.1.
 
 ## Rollout checklist
 
@@ -292,4 +296,4 @@ state and lifecycle semantics change materially.
    - activity in two topics by the same sender;
    - an induced failed run if a safe test path is available.
 8. Return logging to `info`.
-9. Publish v0.2.0 only after the live sequence remains stable.
+9. Publish v0.2.1 only after the live sequence remains stable.
