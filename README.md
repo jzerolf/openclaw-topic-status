@@ -10,8 +10,10 @@ conversation or agent thread.
 
 ## What It Does
 
-- Caches Telegram topic context when a message arrives, then sets the active
-  icon only when `before_agent_run` confirms that an agent turn is starting.
+- Caches the exact Telegram topic and per-turn `runId` on inbound delivery,
+  then starts the active icon at the Codex-compatible `before_agent_start`
+  lifecycle phase; `before_agent_run` and sanitized `model_call_started`
+  remain idempotent early fallbacks.
 - Tracks overlapping turns by exact OpenClaw `runId` and keeps the topic marked
   as active until every matching run has ended.
 - Sets a final idle or error icon from `agent_end`; stale or ambiguous terminal
@@ -30,7 +32,7 @@ conversation or agent thread.
 
 | State | Trigger | Meaning |
 | --- | --- | --- |
-| `working` | `before_agent_run` | One or more correlated agent turns are active. |
+| `working` | `before_agent_start`, or `before_agent_run` / `model_call_started` fallback | One or more correlated agent turns are active. |
 | `idle` | Last active `agent_end` with success, after debounce | The agent finished cleanly. |
 | `error` | `agent_end` with failure | The agent turn ended with an error. |
 | `timeout` | rescue timer, `gateway_stop` | No clean final lifecycle event arrived. |
@@ -95,9 +97,10 @@ should do the following:
 5. Never paste, print, or commit the Telegram bot token. Prefer `botTokenFile`
    or an existing Telegram account token file.
 6. Restart the OpenClaw gateway.
-7. Verify with a real Telegram forum topic: `before_agent_run` should switch to
-   `working`, and the last matching `agent_end` should switch to `idle` or
-   `error`. A missing terminal hook should eventually switch to `timeout`.
+7. Verify with a real Telegram forum topic: the agent harness start should
+   switch immediately to `working`, and the last matching `agent_end` should
+   switch to `idle` or `error`. A missing terminal hook should eventually
+   switch to `timeout`.
 
 ## Configure
 

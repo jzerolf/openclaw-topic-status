@@ -1,7 +1,7 @@
 # Reliability plan for v0.2
 
 Status: implemented for v0.2.0, with cross-registration terminal handling
-hardened in v0.2.1.
+hardened in v0.2.1 and Codex harness activation added in v0.2.2.
 
 Reviewed against:
 
@@ -155,17 +155,22 @@ unless a concrete uncovered lifecycle case requires it.
 The icon should mean "an agent run is active", not merely "Telegram delivered
 an update".
 
-Recommended behavior:
+Implemented behavior:
 
-- `message_received`: cache the typed Telegram target and exact `runId`, but do
-  not make it the sole authority for `working`;
-- `before_agent_run`: request `working`, because this is the documented gate
-  immediately before model input;
-- retain the fast `message_received -> working` transition only if tests prove
-  it cannot leave a topic active when a later gate blocks dispatch.
+- `message_received` caches the exact Telegram target and OpenClaw `runId`;
+- the Codex-compatible `before_agent_start` phase registers that run and
+  requests `working`;
+- `before_agent_run` and sanitized `model_call_started` remain idempotent early
+  start and fallback signals for runtimes that emit them.
 
-Starting at `before_agent_run` is the safer default. The visual delay should be
-negligible and the meaning is accurate.
+The original `before_agent_run`-only design proved insufficient in live use:
+the Codex app-server path emitted `message_received`, `before_agent_start`, and
+`agent_end` for the turn but did not emit `before_agent_run` or
+`model_call_started` to the external plugin. Waiting for an agent-harness hook
+also avoids marking command-only or fast-abort messages as active merely
+because they reached Telegram ingress. The exact `runId` preserves strict
+correlation without relying on message text, sender fallbacks, or an untracked
+provisional state.
 
 ### P1: add a short idle debounce
 
@@ -278,8 +283,9 @@ should use the current exact `runId` contract. For v0.2, choose one of:
   correlation fail safe and cover that legacy path with separate tests.
 
 Reliability is more valuable here than preserving broad compatibility with
-older hook behavior. The state and lifecycle redesign shipped as v0.2.0; the
-cross-registration terminal fix follows as v0.2.1.
+older hook behavior. The state and lifecycle redesign shipped as v0.2.0, the
+cross-registration terminal fix as v0.2.1, and Codex harness activation as
+v0.2.2.
 
 ## Rollout checklist
 
@@ -296,4 +302,4 @@ cross-registration terminal fix follows as v0.2.1.
    - activity in two topics by the same sender;
    - an induced failed run if a safe test path is available.
 8. Return logging to `info`.
-9. Publish v0.2.1 only after the live sequence remains stable.
+9. Publish the current release only after the live sequence remains stable.

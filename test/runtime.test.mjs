@@ -111,8 +111,18 @@ function receive(runtime, topicId, runId, senderId = CHAT_ID) {
 
 function start(runtime, topicId, runId, overrides = {}) {
   receive(runtime, topicId, runId, overrides.senderId);
-  return runtime.onBeforeAgentRun(
+  runtime.onBeforeAgentStart(
     { prompt: "ping", runId },
+    agentContext(topicId, runId, overrides),
+  );
+  runtime.onModelCallStarted(
+    {
+      runId,
+      callId: `${runId}-call-1`,
+      sessionKey: sessionKey(topicId),
+      provider: "openai",
+      model: "gpt-test",
+    },
     agentContext(topicId, runId, overrides),
   );
 }
@@ -148,11 +158,23 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-test("message receipt is cache-only and one run produces working -> idle", { concurrency: false }, async () => {
+test("agent harness start creates an exact run and one turn produces working -> idle", { concurrency: false }, async () => {
   await usingHarness({}, async ({ runtime, calls }) => {
     receive(runtime, 9847, "run-1");
     await runtime._test.waitForWrites();
-    assert.equal(calls.length, 0);
+    assert.deepEqual(icons(calls), []);
+    assert.equal(runtime._state.byRun.size, 0);
+
+    runtime.onBeforeAgentStart(
+      {
+        prompt: "ping",
+        runId: "run-1",
+      },
+      agentContext(9847, "run-1"),
+    );
+    await runtime._test.waitForWrites();
+    assert.deepEqual(icons(calls), ["working"]);
+    assert.equal(runtime._state.byRun.size, 1);
 
     assert.deepEqual(
       runtime.onBeforeAgentRun(
@@ -169,6 +191,25 @@ test("message receipt is cache-only and one run produces working -> idle", { con
     assert.deepEqual(icons(calls), ["working", "idle"]);
     assert.equal(runtime._state.byTopic.size, 0);
     assert.equal(runtime._state.byRun.size, 0);
+  });
+});
+
+test("legacy inbound without runId stays cache-only until before_agent_run", { concurrency: false }, async () => {
+  await usingHarness({}, async ({ runtime, calls }) => {
+    receive(runtime, 9848, undefined);
+    await runtime._test.waitForWrites();
+    assert.deepEqual(icons(calls), []);
+
+    runtime.onBeforeAgentRun(
+      { prompt: "ping" },
+      agentContext(9848, "run-legacy-start"),
+    );
+    await runtime._test.waitForWrites();
+    assert.deepEqual(icons(calls), ["working"]);
+
+    end(runtime, 9848, "run-legacy-start");
+    await runtime._test.waitForWrites();
+    assert.deepEqual(icons(calls), ["working", "idle"]);
   });
 });
 
@@ -326,8 +367,11 @@ test("separate plugin registrations share start and terminal state", { concurren
         runId: "run-split-registry",
       },
     );
-    firstHooks.get("before_agent_run")(
-      { prompt: "ping", runId: "run-split-registry" },
+    firstHooks.get("before_agent_start")(
+      {
+        prompt: "ping",
+        runId: "run-split-registry",
+      },
       agentContext(14501, "run-split-registry"),
     );
     await waitUntil(() => calls.length === 1);
