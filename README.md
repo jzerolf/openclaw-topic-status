@@ -50,18 +50,18 @@ message before continuing with tools or more work.
 
 ## Install
 
-During early development, install from Git:
+Install the latest reviewed release from Git:
 
 ```bash
-openclaw plugins install git:github.com/jzerolf/openclaw-topic-status@main
+openclaw plugins install git:github.com/jzerolf/openclaw-topic-status@v0.2.2
 openclaw plugins enable openclaw-topic-status
 openclaw gateway restart
 ```
 
-For local development:
+For local development against the current `main` branch:
 
 ```bash
-git clone https://github.com/jzerolf/openclaw-topic-status.git
+git clone --branch main https://github.com/jzerolf/openclaw-topic-status.git
 cd openclaw-topic-status
 npm test
 openclaw plugins install --link .
@@ -69,8 +69,8 @@ openclaw plugins enable openclaw-topic-status
 openclaw gateway restart
 ```
 
-The intended public distribution target is ClawHub once the package has its
-first reviewed release.
+GitHub Releases is the current stable distribution channel. ClawHub
+distribution remains planned separately.
 
 ## Agent-Friendly Installation
 
@@ -82,7 +82,7 @@ should do the following:
 2. Install the plugin from this repository:
 
    ```bash
-   openclaw plugins install git:github.com/jzerolf/openclaw-topic-status@main
+   openclaw plugins install git:github.com/jzerolf/openclaw-topic-status@v0.2.2
    ```
 
    If the plugin manager is not available, clone this repository into the
@@ -131,14 +131,22 @@ Minimal config:
 }
 ```
 
-The plugin can read the Telegram bot token from:
+The plugin resolves the Telegram bot token in this order:
 
-1. `config.botTokenEnv`
-2. `config.botTokenFile`
-3. the configured Telegram account `tokenFile`
-4. the root Telegram channel `tokenFile`
+1. the environment variable named by `config.botTokenEnv`
+2. `TELEGRAM_<ACCOUNT>_BOT_TOKEN`, with the account id uppercased and
+   non-alphanumeric characters replaced by underscores
+3. `TELEGRAM_BOT_TOKEN`
+4. `OPENCLAW_TELEGRAM_BOT_TOKEN`
+5. `config.botTokenFile`
+6. the configured Telegram account `tokenFile`
+7. the root Telegram channel `tokenFile`
+8. the account or root Telegram `botToken` value as a legacy compatibility
+   fallback
 
-Never commit bot tokens to a repo.
+Prefer an environment variable or token file. Never paste a token into logs or
+commit bot tokens to a repo; inline `botToken` values are supported only for
+legacy configurations.
 
 ## Choosing Topic Icons
 
@@ -264,10 +272,16 @@ Supported icon states are `working`, `idle`, `error`, and `timeout`.
 | `allowedChatIds` | string[] | `[]` | Restrict to specific Telegram chat ids. |
 | `observeMessageSent` | boolean | `true` | Refresh timeout when outgoing messages are delivered. |
 | `logLevel` | string | `info` | One of `off`, `info`, or `debug`. |
-| `icons.working` | string | required | Telegram custom emoji id for active work. |
-| `icons.idle` | string | required | Telegram custom emoji id for clean completion. |
+| `icons.working` | string | inherited or required | Telegram custom emoji id for active work. |
+| `icons.idle` | string | inherited or required | Telegram custom emoji id for clean completion. |
 | `icons.error` | string | falls back to `idle` | Telegram custom emoji id for failed turns. |
 | `icons.timeout` | string | falls back to `error` | Telegram custom emoji id for timeout rescue. |
+
+When `config.icons` does not provide both `working` and `idle`, the plugin
+inherits a complete `topicStatusIcons` map from Telegram configuration in this
+order: the matching direct chat, the selected account, then the root Telegram
+channel. `working` and `idle` are required only when no complete inherited map
+is available.
 
 The legacy keys `workingIconCustomEmojiId`, `idleIconCustomEmojiId`,
 `errorIconCustomEmojiId`, and `timeoutIconCustomEmojiId` are still accepted for
