@@ -1,11 +1,19 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import https from "node:https";
 
 const PLUGIN_ID = "openclaw-topic-status";
+const PLUGIN_VERSION = "0.2.0";
 const DEFAULT_CHANNEL_ID = "telegram";
 const DEFAULT_API_ROOT = "https://api.telegram.org";
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+const DEFAULT_IDLE_DEBOUNCE_MS = 600;
+const DEFAULT_RETRY_ATTEMPTS = 3;
+const DEFAULT_RETRY_BASE_MS = 400;
+const DEFAULT_RETRY_MAX_MS = 10_000;
+const TARGET_CACHE_TTL_MS = 10 * 60 * 1000;
+const TARGET_CACHE_MAX_ENTRIES = 1_000;
 
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -22,23 +30,51 @@ function cleanStringList(value) {
   return value.map(cleanString).filter(Boolean);
 }
 
+function boundedInteger(value, fallback, minimum, maximum) {
+  const candidate =
+    typeof value === "number" && Number.isFinite(value) ? Math.trunc(value) : fallback;
+  return Math.max(minimum, Math.min(maximum, candidate));
+}
+
 function normalizeConfig(rawConfig) {
   const raw = isRecord(rawConfig) ? rawConfig : {};
   const rawIcons = isRecord(raw.icons) ? raw.icons : {};
+  const retryBaseMs = boundedInteger(
+    raw.telegramRetryBaseMs,
+    DEFAULT_RETRY_BASE_MS,
+    0,
+    30_000,
+  );
   return {
     enabled: raw.enabled !== false,
     channelId: cleanString(raw.channelId) ?? DEFAULT_CHANNEL_ID,
     apiRoot: (cleanString(raw.apiRoot) ?? DEFAULT_API_ROOT).replace(/\/+$/, ""),
     botTokenEnv: cleanString(raw.botTokenEnv),
     botTokenFile: cleanString(raw.botTokenFile),
-    timeoutMs:
-      typeof raw.timeoutMs === "number" && Number.isFinite(raw.timeoutMs)
-        ? Math.max(1000, Math.min(7_200_000, Math.trunc(raw.timeoutMs)))
-        : DEFAULT_TIMEOUT_MS,
+    timeoutMs: boundedInteger(raw.timeoutMs, DEFAULT_TIMEOUT_MS, 1_000, 7_200_000),
+    idleDebounceMs: boundedInteger(
+      raw.idleDebounceMs,
+      DEFAULT_IDLE_DEBOUNCE_MS,
+      0,
+      10_000,
+    ),
     timeoutState:
       raw.timeoutState === "idle" || raw.timeoutState === "error" || raw.timeoutState === "timeout"
         ? raw.timeoutState
         : "timeout",
+    telegramRetryAttempts: boundedInteger(
+      raw.telegramRetryAttempts,
+      DEFAULT_RETRY_ATTEMPTS,
+      1,
+      5,
+    ),
+    telegramRetryBaseMs: retryBaseMs,
+    telegramRetryMaxMs: boundedInteger(
+      raw.telegramRetryMaxMs,
+      Math.max(DEFAULT_RETRY_MAX_MS, retryBaseMs),
+      retryBaseMs,
+      30_000,
+    ),
     onlyAccountIds: cleanStringList(raw.onlyAccountIds),
     allowedChatIds: cleanStringList(raw.allowedChatIds),
     observeMessageSent: raw.observeMessageSent !== false,
@@ -65,8 +101,7 @@ function makeLog(api, config) {
     },
     debug(message) {
       if (config.logLevel === "debug") {
-        // OpenClaw's default journal output may suppress logger.debug; when
-        // explicit debug logging is enabled for this plugin, keep it visible.
+        // OpenClaw's default journal output may suppress logger.debug.
         (logger.info ?? logger.debug)?.(`[${PLUGIN_ID}] debug: ${message}`);
       }
     },
@@ -162,15 +197,16 @@ function resolveTopicState(event, ctx, config) {
     return null;
   }
 
+  const contextChannelId = cleanString(ctx?.channelId);
   const parsedTargets = [
     parseTelegramTarget(ctx?.conversationId),
-    parseTelegramTarget(ctx?.channelId),
     parseTelegramTarget(ctx?.sessionKey),
     parseTelegramTarget(event?.sessionKey),
     parseTelegramTarget(metadata.originatingTo),
     parseTelegramTarget(metadata.to),
     parseTelegramTarget(event?.to),
     parseTelegramTarget(event?.from),
+    contextChannelId === config.channelId ? {} : parseTelegramTarget(contextChannelId),
   ];
 
   const chatId = parsedTargets.find((target) => target.chatId)?.chatId;
@@ -188,7 +224,6 @@ function resolveTopicState(event, ctx, config) {
 
   const sessionKey = cleanString(ctx?.sessionKey) ?? cleanString(event?.sessionKey);
   const runId = cleanString(ctx?.runId) ?? cleanString(event?.runId);
-  const senderId = cleanString(ctx?.senderId) ?? cleanString(event?.senderId);
   const topicKey = `${accountId ?? "default"}:${chatId}:${threadId}`;
   return {
     accountId,
@@ -196,9 +231,7 @@ function resolveTopicState(event, ctx, config) {
     threadId,
     sessionKey,
     runId,
-    senderId,
     topicKey,
-    seq: 0,
   };
 }
 
@@ -264,7 +297,7 @@ function readTokenFromFile(filePath, log) {
   try {
     return cleanString(fs.readFileSync(tokenFile, "utf8"));
   } catch (error) {
-    log.warn(`cannot read Telegram token file ${tokenFile}: ${String(error)}`);
+    log.warn(`cannot read Telegram token file ${tokenFile}: ${safeErrorMessage(error)}`);
     return undefined;
   }
 }
@@ -294,36 +327,128 @@ function resolveTelegramToken(api, config, state, log) {
   );
 }
 
-async function editForumTopicIcon(api, config, log, state, status) {
+function safeErrorMessage(error) {
+  const raw = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return raw
+    .replace(/bot\d+:[A-Za-z0-9_-]+/gi, "bot<redacted>")
+    .replace(/\d+:[A-Za-z0-9_-]{20,}/g, "<redacted>")
+    .slice(0, 500);
+}
+
+function shortRunId(runId) {
+  const normalized = cleanString(runId);
+  return normalized
+    ? crypto.createHash("sha256").update(normalized).digest("hex").slice(0, 10)
+    : "legacy";
+}
+
+function responseDescription(response) {
+  return (
+    cleanString(response?.body?.description) ??
+    cleanString(response?.statusText) ??
+    "unknown Telegram error"
+  );
+}
+
+function isSuccessfulTelegramResponse(response) {
+  return Boolean(response?.ok && response?.body?.ok === true);
+}
+
+function isRetryableTelegramResponse(response) {
+  const status = Number(response?.status ?? response?.body?.error_code ?? 0);
+  return status === 429 || status >= 500;
+}
+
+function retryAfterMs(response) {
+  const seconds = response?.body?.parameters?.retry_after;
+  return typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0
+    ? Math.trunc(seconds * 1_000)
+    : undefined;
+}
+
+function delay(ms) {
+  if (typeof globalThis.__telegramTopicStatusSleep === "function") {
+    return globalThis.__telegramTopicStatusSleep(ms);
+  }
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function editForumTopicIcon(api, config, log, state, status, revision, source) {
   const icons = resolveIcons(api, config, state);
   if (!icons) {
-    log.debug(`no icons configured for ${state.topicKey}; skipping ${status}`);
-    return;
+    log.warn(`icons unavailable for topic=${state.topicKey}; cannot apply ${status}`);
+    return false;
   }
   const iconCustomEmojiId = icons[status];
   if (!iconCustomEmojiId) {
-    return;
+    log.warn(`icon unavailable for state=${status} topic=${state.topicKey}`);
+    return false;
   }
   const token = resolveTelegramToken(api, config, state, log);
   if (!token) {
-    log.warn("Telegram token unavailable; cannot update topic icon");
-    return;
+    log.warn(`Telegram token unavailable; cannot update topic=${state.topicKey}`);
+    return false;
   }
 
-  const response = await postJson(`${config.apiRoot}/bot${token}/editForumTopic`, {
-    chat_id: state.chatId,
-    message_thread_id: state.threadId,
-    icon_custom_emoji_id: iconCustomEmojiId,
-  });
-
-  if (!response.ok) {
-    const description = cleanString(response.body?.description) ?? response.statusText;
-    log.warn(
-      `editForumTopic failed for ${state.chatId}/${state.threadId} (${status}): ${response.status} ${description}`,
+  for (let attempt = 1; attempt <= config.telegramRetryAttempts; attempt += 1) {
+    log.debug(
+      `write start topic=${state.topicKey} gen=${state.generation} rev=${revision} status=${status} source=${source} attempt=${attempt}`,
     );
-    return;
+    let response;
+    try {
+      response = await postJson(`${config.apiRoot}/bot${token}/editForumTopic`, {
+        chat_id: state.chatId,
+        message_thread_id: state.threadId,
+        icon_custom_emoji_id: iconCustomEmojiId,
+      });
+    } catch (error) {
+      if (attempt >= config.telegramRetryAttempts) {
+        log.warn(
+          `editForumTopic transport failure topic=${state.topicKey} status=${status} after ${attempt} attempt(s): ${safeErrorMessage(error)}`,
+        );
+        return false;
+      }
+      const backoffMs = Math.min(
+        config.telegramRetryMaxMs,
+        config.telegramRetryBaseMs * 2 ** (attempt - 1),
+      );
+      log.debug(
+        `write retry topic=${state.topicKey} gen=${state.generation} rev=${revision} status=${status} in=${backoffMs}ms reason=transport`,
+      );
+      await delay(backoffMs);
+      continue;
+    }
+
+    if (isSuccessfulTelegramResponse(response)) {
+      log.debug(
+        `write success topic=${state.topicKey} gen=${state.generation} rev=${revision} status=${status}`,
+      );
+      return true;
+    }
+
+    const canRetry =
+      attempt < config.telegramRetryAttempts && isRetryableTelegramResponse(response);
+    if (!canRetry) {
+      const statusCode = Number(response?.status ?? response?.body?.error_code ?? 0);
+      log.warn(
+        `editForumTopic rejected topic=${state.topicKey} status=${status}: ${statusCode} ${safeErrorMessage(responseDescription(response))}`,
+      );
+      return false;
+    }
+
+    const explicitRetryAfterMs = retryAfterMs(response);
+    const backoffMs =
+      explicitRetryAfterMs ??
+      Math.min(
+        config.telegramRetryMaxMs,
+        config.telegramRetryBaseMs * 2 ** (attempt - 1),
+      );
+    log.debug(
+      `write retry topic=${state.topicKey} gen=${state.generation} rev=${revision} status=${status} in=${backoffMs}ms reason=${Number(response?.status ?? response?.body?.error_code ?? 0)}`,
+    );
+    await delay(backoffMs);
   }
-  log.debug(`set ${status} icon for ${state.chatId}/${state.threadId}`);
+  return false;
 }
 
 function postJson(url, payload) {
@@ -383,221 +508,505 @@ function postJson(url, payload) {
 function createRuntime(api) {
   const config = normalizeConfig(api.pluginConfig);
   const log = makeLog(api, config);
-  const bySession = new Map();
-  const byRun = new Map();
   const byTopic = new Map();
-  const latestBySender = new Map();
-  const topicSeq = new Map();
-  const timeoutByTopic = new Map();
-  const completedTopicSeq = new Set();
+  const byRun = new Map();
+  const runsBySession = new Map();
+  const targetsBySession = new Map();
+  const targetsByRun = new Map();
+  let stopping = false;
 
-  function senderKey(state) {
-    return state.senderId
-      ? `${state.accountId ?? "default"}:${state.chatId}:${state.senderId}`
-      : undefined;
+  function createTopicState(target) {
+    return {
+      ...target,
+      generation: 1,
+      activeRuns: new Map(),
+      sessionKeys: new Set(),
+      desiredStatus: undefined,
+      desiredRevision: 0,
+      processedRevision: 0,
+      appliedStatus: undefined,
+      writerPromise: null,
+      revisionWaiters: [],
+      idleTimer: null,
+      rescueTimer: null,
+      terminal: false,
+    };
   }
 
-  function remember(state) {
-    const seq = (topicSeq.get(state.topicKey) ?? 0) + 1;
-    const next = { ...state, seq };
-    topicSeq.set(next.topicKey, seq);
-    completedTopicSeq.delete(`${next.topicKey}:${next.seq}`);
-    if (next.sessionKey) {
-      bySession.set(next.sessionKey, next);
+  function updateTopicTarget(state, target) {
+    state.accountId = target.accountId;
+    state.chatId = target.chatId;
+    state.threadId = target.threadId;
+    state.topicKey = target.topicKey;
+    if (target.sessionKey) {
+      state.sessionKey = target.sessionKey;
+      state.sessionKeys.add(target.sessionKey);
     }
-    if (next.runId) {
-      byRun.set(next.runId, next);
-    }
-    byTopic.set(next.topicKey, next);
-    const key = senderKey(next);
-    if (key) {
-      latestBySender.set(key, { state: next, at: Date.now() });
-    }
-    return next;
   }
 
-  function associateRun(state, runId) {
-    const normalizedRunId = cleanString(runId);
-    if (!normalizedRunId) {
-      return state;
+  function clearIdleTimer(state) {
+    if (state.idleTimer) {
+      clearTimeout(state.idleTimer);
+      state.idleTimer = null;
     }
-    const next = { ...state, runId: normalizedRunId };
-    byRun.set(normalizedRunId, next);
-    if (next.sessionKey) {
-      bySession.set(next.sessionKey, next);
-    }
-    byTopic.set(next.topicKey, next);
-    return next;
   }
 
-  function lookup(event, ctx) {
-    const runId = cleanString(ctx?.runId) ?? cleanString(event?.runId);
-    if (runId && byRun.has(runId)) {
-      return byRun.get(runId);
+  function clearRescueTimer(state) {
+    if (state.rescueTimer) {
+      clearTimeout(state.rescueTimer);
+      state.rescueTimer = null;
     }
-    const sessionKey = cleanString(ctx?.sessionKey) ?? cleanString(event?.sessionKey);
-    if (sessionKey && bySession.has(sessionKey)) {
-      return bySession.get(sessionKey);
-    }
-    const senderId = cleanString(ctx?.senderId) ?? cleanString(event?.senderId);
-    const accountId = cleanString(ctx?.accountId) ?? "default";
-    if (senderId) {
-      for (const record of latestBySender.values()) {
-        const state = record.state;
-        if (
-          state.senderId === senderId &&
-          (state.accountId ?? "default") === accountId &&
-          Date.now() - record.at < 120_000
-        ) {
-          return state;
-        }
+  }
+
+  function settleRevisionWaiters(state) {
+    const remaining = [];
+    for (const waiter of state.revisionWaiters) {
+      if (waiter.revision <= state.processedRevision) {
+        waiter.resolve();
+      } else {
+        remaining.push(waiter);
       }
     }
-    const resolved = resolveTopicState(event, ctx, config);
-    if (!resolved) {
-      return null;
-    }
-    return byTopic.get(resolved.topicKey) ?? resolved;
+    state.revisionWaiters = remaining;
   }
 
-  function clearTimeoutFor(state) {
-    const existing = timeoutByTopic.get(state.topicKey);
-    if (existing) {
-      clearTimeout(existing);
-      timeoutByTopic.delete(state.topicKey);
+  function waitForRevision(state, revision) {
+    if (state.processedRevision >= revision) {
+      return Promise.resolve();
     }
-  }
-
-  function scheduleRescue(state) {
-    if (config.timeoutMs <= 0) {
-      return;
-    }
-    if (completedTopicSeq.has(`${state.topicKey}:${state.seq}`)) {
-      return;
-    }
-    const currentSeq = topicSeq.get(state.topicKey);
-    if (currentSeq !== undefined && currentSeq !== state.seq) {
-      log.debug(
-        `skip rescue for stale ${state.topicKey}: current seq=${currentSeq}, state seq=${state.seq}`,
-      );
-      return;
-    }
-    clearTimeoutFor(state);
-    const timer = setTimeout(() => {
-      if (topicSeq.get(state.topicKey) !== state.seq) {
-        return;
-      }
-      const rescueStatus = config.timeoutState;
-      void editForumTopicIcon(api, config, log, state, rescueStatus).catch((error) => {
-        log.warn(`timeout rescue failed for ${state.topicKey}: ${String(error)}`);
-      });
-    }, config.timeoutMs);
-    timer.unref?.();
-    timeoutByTopic.set(state.topicKey, timer);
-  }
-
-  function applyStatus(state, status) {
-    const currentSeq = topicSeq.get(state.topicKey);
-    if (currentSeq !== undefined && currentSeq !== state.seq) {
-      log.debug(
-        `skip ${status} for stale ${state.topicKey}: current seq=${currentSeq}, state seq=${state.seq}`,
-      );
-      return;
-    }
-    if (status === "idle" || status === "error") {
-      clearTimeoutFor(state);
-      completedTopicSeq.add(`${state.topicKey}:${state.seq}`);
-      if (state.runId) {
-        byRun.delete(state.runId);
-      }
-      if (state.sessionKey) {
-        bySession.delete(state.sessionKey);
-      }
-      byTopic.delete(state.topicKey);
-    } else {
-      scheduleRescue(state);
-    }
-    void editForumTopicIcon(api, config, log, state, status).catch((error) => {
-      log.warn(`failed setting ${status} for ${state.topicKey}: ${String(error)}`);
+    return new Promise((resolve) => {
+      state.revisionWaiters.push({ revision, resolve });
     });
   }
 
-  function onMessageReceived(event, ctx) {
-    const state = resolveTopicState(event, ctx, config);
-    if (!state) {
+  async function drainWriter(state) {
+    while (state.processedRevision < state.desiredRevision) {
+      const revision = state.desiredRevision;
+      const status = state.desiredStatus;
+      const source = state.desiredSource;
+      let applied = state.appliedStatus === status;
+      if (!applied) {
+        applied = await editForumTopicIcon(api, config, log, state, status, revision, source);
+      } else {
+        log.debug(
+          `write skip topic=${state.topicKey} gen=${state.generation} rev=${revision} status=${status} reason=already-applied`,
+        );
+      }
+      if (applied) {
+        state.appliedStatus = status;
+      }
+      state.processedRevision = Math.max(state.processedRevision, revision);
+      settleRevisionWaiters(state);
+    }
+  }
+
+  function ensureWriter(state) {
+    if (state.writerPromise) {
       return;
     }
-    const remembered = remember(state);
-    log.debug(`message_received -> working ${remembered.topicKey}`);
-    applyStatus(remembered, "working");
+    state.writerPromise = drainWriter(state)
+      .catch((error) => {
+        log.warn(`writer failure topic=${state.topicKey}: ${safeErrorMessage(error)}`);
+        state.processedRevision = state.desiredRevision;
+        settleRevisionWaiters(state);
+      })
+      .finally(() => {
+        state.writerPromise = null;
+        if (state.processedRevision < state.desiredRevision) {
+          ensureWriter(state);
+        }
+      });
+  }
+
+  function queueStatus(state, status, source) {
+    state.desiredRevision += 1;
+    state.desiredStatus = status;
+    state.desiredSource = source;
+    const revision = state.desiredRevision;
+    log.debug(
+      `transition topic=${state.topicKey} gen=${state.generation} rev=${revision} desired=${status} applied=${state.appliedStatus ?? "none"} source=${source}`,
+    );
+    ensureWriter(state);
+    return { revision, done: waitForRevision(state, revision) };
+  }
+
+  function pruneTargetCache() {
+    const cutoff = Date.now() - TARGET_CACHE_TTL_MS;
+    for (const [key, record] of targetsBySession) {
+      if (record.at < cutoff) {
+        targetsBySession.delete(key);
+      }
+    }
+    for (const [key, record] of targetsByRun) {
+      if (record.at < cutoff) {
+        targetsByRun.delete(key);
+      }
+    }
+    while (targetsBySession.size > TARGET_CACHE_MAX_ENTRIES) {
+      targetsBySession.delete(targetsBySession.keys().next().value);
+    }
+    while (targetsByRun.size > TARGET_CACHE_MAX_ENTRIES) {
+      targetsByRun.delete(targetsByRun.keys().next().value);
+    }
+  }
+
+  function cacheTarget(target) {
+    const record = { target, at: Date.now() };
+    if (target.sessionKey) {
+      targetsBySession.set(target.sessionKey, record);
+    }
+    if (target.runId) {
+      targetsByRun.set(target.runId, record);
+    }
+    pruneTargetCache();
+  }
+
+  function resolveStartTarget(event, ctx) {
+    const direct = resolveTopicState(event, ctx, config);
+    if (direct) {
+      return direct;
+    }
+    const runId = cleanString(ctx?.runId) ?? cleanString(event?.runId);
+    if (runId && targetsByRun.has(runId)) {
+      return targetsByRun.get(runId).target;
+    }
+    const sessionKey = cleanString(ctx?.sessionKey) ?? cleanString(event?.sessionKey);
+    return sessionKey ? targetsBySession.get(sessionKey)?.target ?? null : null;
+  }
+
+  function removeRun(runId, record) {
+    byRun.delete(runId);
+    record.state.activeRuns.delete(runId);
+    const sessionKey = record.sessionKey;
+    if (sessionKey) {
+      const sessionRuns = runsBySession.get(sessionKey);
+      sessionRuns?.delete(runId);
+      if (sessionRuns?.size === 0) {
+        runsBySession.delete(sessionKey);
+      }
+    }
+  }
+
+  function removeAllRuns(state) {
+    for (const [runId] of state.activeRuns) {
+      const record = byRun.get(runId);
+      if (record) {
+        removeRun(runId, record);
+      } else {
+        state.activeRuns.delete(runId);
+      }
+    }
+  }
+
+  function cleanupTopic(state, generation) {
+    if (
+      state.generation !== generation ||
+      !state.terminal ||
+      state.activeRuns.size > 0 ||
+      state.processedRevision < state.desiredRevision
+    ) {
+      return;
+    }
+    clearIdleTimer(state);
+    clearRescueTimer(state);
+    if (byTopic.get(state.topicKey) === state) {
+      byTopic.delete(state.topicKey);
+    }
+    for (const sessionKey of state.sessionKeys) {
+      const record = targetsBySession.get(sessionKey);
+      if (record?.target.topicKey === state.topicKey) {
+        targetsBySession.delete(sessionKey);
+      }
+    }
+    for (const [runId, record] of targetsByRun) {
+      if (record.target.topicKey === state.topicKey) {
+        targetsByRun.delete(runId);
+      }
+    }
+    state.revisionWaiters.splice(0).forEach((waiter) => waiter.resolve());
+    log.debug(`cleanup topic=${state.topicKey} gen=${generation}`);
+  }
+
+  function finalizeGeneration(state, status, source) {
+    if (state.terminal) {
+      return waitForRevision(state, state.desiredRevision);
+    }
+    const generation = state.generation;
+    state.terminal = true;
+    clearIdleTimer(state);
+    clearRescueTimer(state);
+    removeAllRuns(state);
+    const transition = queueStatus(state, status, source);
+    void transition.done.then(() => cleanupTopic(state, generation));
+    return transition.done;
+  }
+
+  function rescueGeneration(state, generation, source = "rescue_timeout") {
+    if (
+      state.generation !== generation ||
+      state.terminal ||
+      state.activeRuns.size === 0
+    ) {
+      return Promise.resolve();
+    }
+    state.rescueTimer = null;
+    log.debug(
+      `rescue topic=${state.topicKey} gen=${generation} active=${state.activeRuns.size}`,
+    );
+    return finalizeGeneration(state, config.timeoutState, source);
+  }
+
+  function scheduleRescue(state) {
+    if (state.terminal || state.activeRuns.size === 0) {
+      clearRescueTimer(state);
+      return;
+    }
+    clearRescueTimer(state);
+    const generation = state.generation;
+    const timer = setTimeout(() => {
+      void rescueGeneration(state, generation);
+    }, config.timeoutMs);
+    timer.unref?.();
+    state.rescueTimer = timer;
+  }
+
+  function beginNewGeneration(state, target) {
+    clearIdleTimer(state);
+    clearRescueTimer(state);
+    removeAllRuns(state);
+    state.generation += 1;
+    state.terminal = false;
+    state.activeRuns.clear();
+    state.sessionKeys.clear();
+    updateTopicTarget(state, target);
+    log.debug(`generation start topic=${state.topicKey} gen=${state.generation}`);
+  }
+
+  function ensureTopic(target) {
+    let state = byTopic.get(target.topicKey);
+    if (!state) {
+      state = createTopicState(target);
+      updateTopicTarget(state, target);
+      byTopic.set(target.topicKey, state);
+      log.debug(`generation start topic=${state.topicKey} gen=${state.generation}`);
+    } else if (state.terminal) {
+      beginNewGeneration(state, target);
+    } else {
+      updateTopicTarget(state, target);
+    }
+    return state;
+  }
+
+  function activeRecordForTerminal(event, ctx, source) {
+    const runId = cleanString(ctx?.runId) ?? cleanString(event?.runId);
+    if (runId) {
+      const record = byRun.get(runId);
+      if (!record || record.state.generation !== record.generation) {
+        log.debug(`${source} ignored run=${shortRunId(runId)} reason=unknown-or-stale`);
+        return null;
+      }
+      return { runId, record };
+    }
+
+    const sessionKey = cleanString(ctx?.sessionKey) ?? cleanString(event?.sessionKey);
+    const candidates = sessionKey
+      ? [...(runsBySession.get(sessionKey) ?? [])].filter((candidate) => byRun.has(candidate))
+      : [];
+    if (candidates.length !== 1) {
+      log.debug(
+        `${source} ignored run=legacy reason=${candidates.length === 0 ? "unmatched" : "ambiguous"}`,
+      );
+      return null;
+    }
+    const legacyRunId = candidates[0];
+    return { runId: legacyRunId, record: byRun.get(legacyRunId) };
+  }
+
+  function scheduleIdle(state) {
+    clearRescueTimer(state);
+    clearIdleTimer(state);
+    const generation = state.generation;
+    const finish = () => {
+      state.idleTimer = null;
+      if (
+        state.generation === generation &&
+        !state.terminal &&
+        state.activeRuns.size === 0
+      ) {
+        void finalizeGeneration(state, "idle", "agent_end");
+      }
+    };
+    if (config.idleDebounceMs === 0) {
+      finish();
+      return;
+    }
+    state.idleTimer = setTimeout(finish, config.idleDebounceMs);
+    state.idleTimer.unref?.();
+  }
+
+  function onMessageReceived(event, ctx) {
+    if (stopping) {
+      return;
+    }
+    const target = resolveTopicState(event, ctx, config);
+    if (!target) {
+      return;
+    }
+    cacheTarget(target);
+    log.debug(
+      `message_received cached topic=${target.topicKey} run=${shortRunId(target.runId)}`,
+    );
   }
 
   function onBeforeAgentRun(event, ctx) {
-    const state = lookup(event, ctx);
-    if (state) {
-      const associated = associateRun(state, ctx?.runId);
-      log.debug(`before_agent_run -> keep working ${associated.topicKey}`);
-      applyStatus(associated, "working");
+    if (stopping) {
+      return { outcome: "pass" };
     }
+    const runId = cleanString(ctx?.runId) ?? cleanString(event?.runId);
+    if (!runId) {
+      log.debug("before_agent_run ignored run=legacy reason=missing-runId");
+      return { outcome: "pass" };
+    }
+
+    const existing = byRun.get(runId);
+    if (existing) {
+      const state = existing.state;
+      clearIdleTimer(state);
+      scheduleRescue(state);
+      queueStatus(state, "working", "before_agent_run_duplicate");
+      log.debug(
+        `before_agent_run duplicate topic=${state.topicKey} gen=${state.generation} run=${shortRunId(runId)}`,
+      );
+      return { outcome: "pass" };
+    }
+
+    const target = resolveStartTarget(event, ctx);
+    if (!target) {
+      log.debug(`before_agent_run ignored run=${shortRunId(runId)} reason=topic-unresolved`);
+      return { outcome: "pass" };
+    }
+    const state = ensureTopic({ ...target, runId });
+    clearIdleTimer(state);
+    const sessionKey = cleanString(ctx?.sessionKey) ?? cleanString(event?.sessionKey) ?? target.sessionKey;
+    state.activeRuns.set(runId, { sessionKey });
+    byRun.set(runId, { state, generation: state.generation, sessionKey });
+    if (sessionKey) {
+      state.sessionKeys.add(sessionKey);
+      const sessionRuns = runsBySession.get(sessionKey) ?? new Set();
+      sessionRuns.add(runId);
+      runsBySession.set(sessionKey, sessionRuns);
+    }
+    targetsByRun.delete(runId);
+    scheduleRescue(state);
+    queueStatus(state, "working", "before_agent_run");
+    log.debug(
+      `before_agent_run topic=${state.topicKey} gen=${state.generation} run=${shortRunId(runId)} active=${state.activeRuns.size}`,
+    );
     return { outcome: "pass" };
   }
 
   function onMessageSent(event, ctx) {
-    if (!config.observeMessageSent || event?.success === false) {
+    if (!config.observeMessageSent || event?.success === false || stopping) {
       return;
     }
-    const state = lookup(event, ctx);
-    if (!state) {
+    const match = activeRecordForTerminal(event, ctx, "message_sent");
+    if (!match) {
       return;
     }
-    log.debug(`message_sent -> refresh timeout ${state.topicKey}`);
-    scheduleRescue(state);
+    scheduleRescue(match.record.state);
+    log.debug(
+      `message_sent refresh topic=${match.record.state.topicKey} run=${shortRunId(match.runId)}`,
+    );
   }
 
   function onAgentEnd(event, ctx) {
-    const state = lookup(event, ctx);
-    if (!state) {
+    if (stopping) {
       return;
     }
-    const finalState = event?.success === false ? "error" : "idle";
-    log.debug(`agent_end -> ${finalState} ${state.topicKey}`);
-    applyStatus(state, finalState);
-  }
-
-  function onSessionEnd(event, ctx) {
-    const state = lookup(event, ctx);
-    if (!state) {
+    const match = activeRecordForTerminal(event, ctx, "agent_end");
+    if (!match) {
       return;
     }
-    if (event?.reason === "compaction" && (event.nextSessionId || event.nextSessionKey)) {
-      log.debug(`session_end compaction -> keep working ${state.topicKey}`);
+    const { runId, record } = match;
+    const state = record.state;
+    removeRun(runId, record);
+    log.debug(
+      `agent_end topic=${state.topicKey} gen=${state.generation} run=${shortRunId(runId)} success=${event?.success !== false} remaining=${state.activeRuns.size}`,
+    );
+    if (state.activeRuns.size > 0) {
       scheduleRescue(state);
       return;
     }
-    const finalState =
-      event?.reason === "shutdown" || event?.reason === "restart" || event?.reason === "unknown"
-        ? config.timeoutState
-        : "idle";
-    log.debug(`session_end -> ${finalState} ${state.topicKey}`);
-    applyStatus(state, finalState);
+    if (event?.success === false) {
+      void finalizeGeneration(state, "error", "agent_end");
+      return;
+    }
+    scheduleIdle(state);
+  }
+
+  function onSessionEnd(event, ctx) {
+    const sessionKey = cleanString(ctx?.sessionKey) ?? cleanString(event?.sessionKey);
+    if (sessionKey) {
+      targetsBySession.delete(sessionKey);
+    }
+    const activeCount = sessionKey
+      ? [...(runsBySession.get(sessionKey) ?? [])].filter((runId) => byRun.has(runId)).length
+      : 0;
+    log.debug(
+      `session_end bookkeeping reason=${cleanString(event?.reason) ?? "unknown"} active=${activeCount}`,
+    );
   }
 
   async function stop() {
-    const activeStates = [...byTopic.values()];
-    for (const timer of timeoutByTopic.values()) {
-      clearTimeout(timer);
+    if (stopping) {
+      return;
     }
-    timeoutByTopic.clear();
-    if (activeStates.length > 0) {
-      await Promise.allSettled(
-        activeStates.map((state) => editForumTopicIcon(api, config, log, state, config.timeoutState)),
-      );
+    stopping = true;
+    const pending = [];
+    for (const state of byTopic.values()) {
+      clearIdleTimer(state);
+      clearRescueTimer(state);
+      if (state.activeRuns.size > 0) {
+        pending.push(finalizeGeneration(state, config.timeoutState, "gateway_stop"));
+      } else if (!state.terminal) {
+        pending.push(finalizeGeneration(state, "idle", "gateway_stop"));
+      } else if (state.writerPromise) {
+        pending.push(state.writerPromise);
+      }
+    }
+    await Promise.allSettled(pending);
+    for (const state of byTopic.values()) {
+      clearIdleTimer(state);
+      clearRescueTimer(state);
+      state.revisionWaiters.splice(0).forEach((waiter) => waiter.resolve());
     }
     byTopic.clear();
     byRun.clear();
-    bySession.clear();
-    latestBySender.clear();
+    runsBySession.clear();
+    targetsBySession.clear();
+    targetsByRun.clear();
   }
+
+  async function waitForWrites() {
+    for (let pass = 0; pass < 20; pass += 1) {
+      const writers = [...byTopic.values()].map((state) => state.writerPromise).filter(Boolean);
+      if (writers.length === 0) {
+        await new Promise((resolve) => setImmediate(resolve));
+        const stillWriting = [...byTopic.values()].some((state) => state.writerPromise);
+        if (!stillWriting) {
+          return;
+        }
+        continue;
+      }
+      await Promise.allSettled(writers);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    throw new Error("topic-status writers did not settle");
+  }
+
+  log.info(
+    `v${PLUGIN_VERSION} started (idleDebounceMs=${config.idleDebounceMs}, retryAttempts=${config.telegramRetryAttempts})`,
+  );
 
   return {
     onMessageReceived,
@@ -606,7 +1015,20 @@ function createRuntime(api) {
     onAgentEnd,
     onSessionEnd,
     stop,
-    _state: { bySession, byRun, byTopic, topicSeq, timeoutByTopic },
+    _state: {
+      byTopic,
+      byRun,
+      runsBySession,
+      targetsBySession,
+      targetsByRun,
+    },
+    _test: {
+      waitForWrites,
+      rescueTopic(topicKey) {
+        const state = byTopic.get(topicKey);
+        return state ? rescueGeneration(state, state.generation, "test_rescue") : Promise.resolve();
+      },
+    },
   };
 }
 
@@ -622,7 +1044,7 @@ const entry = {
     api.on("message_sent", runtime.onMessageSent, { priority: -10, timeoutMs: 5_000 });
     api.on("agent_end", runtime.onAgentEnd, { priority: -10, timeoutMs: 5_000 });
     api.on("session_end", runtime.onSessionEnd, { priority: -10, timeoutMs: 5_000 });
-    api.on("gateway_stop", () => runtime.stop(), { priority: 0, timeoutMs: 5_000 });
+    api.on("gateway_stop", () => runtime.stop(), { priority: 0, timeoutMs: 30_000 });
   },
 };
 
