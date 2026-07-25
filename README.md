@@ -10,11 +10,16 @@ conversation or agent thread.
 
 ## What It Does
 
-- Sets a topic icon when a message is received.
-- Keeps the topic marked as active while an agent turn is running.
-- Sets a final idle or error icon when the agent turn or session ends.
+- Caches Telegram topic context when a message arrives, then sets the active
+  icon only when `before_agent_run` confirms that an agent turn is starting.
+- Tracks overlapping turns by exact OpenClaw `runId` and keeps the topic marked
+  as active until every matching run has ended.
+- Sets a final idle or error icon from `agent_end`; stale or ambiguous terminal
+  hooks are ignored.
 - Sets a timeout icon if OpenClaw never emits a final lifecycle event or the
   gateway stops while a topic is still active.
+- Serializes and coalesces Telegram writes per topic, adds bounded transient
+  retries, and debounces clean idle transitions for 600 ms by default.
 - Avoids treating `message_sent` as "done"; outgoing messages only refresh the
   watchdog timer.
 - Works as an external OpenClaw plugin without patching OpenClaw core or the
@@ -24,13 +29,16 @@ conversation or agent thread.
 
 | State | Trigger | Meaning |
 | --- | --- | --- |
-| `working` | `message_received`, `before_agent_run` | A user message arrived or an agent turn is active. |
-| `idle` | `agent_end` with success, clean `session_end` | The agent/session finished cleanly. |
+| `working` | `before_agent_run` | One or more correlated agent turns are active. |
+| `idle` | Last active `agent_end` with success, after debounce | The agent finished cleanly. |
 | `error` | `agent_end` with failure | The agent turn ended with an error. |
-| `timeout` | rescue timer, restart/shutdown `session_end`, `gateway_stop` | No clean final lifecycle event arrived. |
+| `timeout` | rescue timer, `gateway_stop` | No clean final lifecycle event arrived. |
 
 `message_sent` is observed only to refresh the timeout while progress updates
 are delivered. It is not a reliable completion signal.
+
+`session_end` is used only for cache bookkeeping. Session reset, compaction,
+idle, restart, or shutdown events cannot close a currently active agent run.
 
 The plugin intentionally does not use OpenClaw's `before_agent_finalize` hook
 as a completion signal. In Codex-backed runtimes that hook maps to the native
@@ -86,9 +94,9 @@ should do the following:
 5. Never paste, print, or commit the Telegram bot token. Prefer `botTokenFile`
    or an existing Telegram account token file.
 6. Restart the OpenClaw gateway.
-7. Verify with a real Telegram forum topic: user message should switch to
-   `working`, and finalization/`agent_end`/`session_end` should switch to
-   `idle`, `error`, or `timeout`.
+7. Verify with a real Telegram forum topic: `before_agent_run` should switch to
+   `working`, and the last matching `agent_end` should switch to `idle` or
+   `error`. A missing terminal hook should eventually switch to `timeout`.
 
 ## Configure
 
@@ -105,6 +113,7 @@ Minimal config:
         },
         "config": {
           "botTokenFile": "/path/to/telegram.bot_token",
+          "idleDebounceMs": 600,
           "icons": {
             "working": "5309832892262654231",
             "idle": "5357121491508928442",
@@ -243,6 +252,10 @@ Supported icon states are `working`, `idle`, `error`, and `timeout`.
 | `botTokenFile` | string | unset | File containing the Telegram bot token. |
 | `timeoutMs` | integer | `1800000` | Rescue timeout, 30 minutes by default. |
 | `timeoutState` | string | `timeout` | One of `idle`, `error`, or `timeout`. |
+| `idleDebounceMs` | integer | `600` | Grace period before clean idle; a new run cancels it. |
+| `telegramRetryAttempts` | integer | `3` | Maximum Telegram attempts for retryable writes. |
+| `telegramRetryBaseMs` | integer | `400` | Initial exponential retry delay. |
+| `telegramRetryMaxMs` | integer | `10000` | Maximum exponential delay; explicit Telegram `retry_after` is honored. |
 | `onlyAccountIds` | string[] | `[]` | Restrict to specific OpenClaw Telegram account ids. |
 | `allowedChatIds` | string[] | `[]` | Restrict to specific Telegram chat ids. |
 | `observeMessageSent` | boolean | `true` | Refresh timeout when outgoing messages are delivered. |
@@ -267,15 +280,18 @@ compatibility.
 
 ## Development
 
+OpenClaw 2026.7.1 or newer is required because v0.2 relies on its stable
+per-turn `runId` correlation contract.
+
 ```bash
 npm test
 npm run pack:dry-run
 ```
 
-The smoke test uses an injected fake Telegram API transport, so it does not send
-real Telegram requests.
+The test suite uses an injected fake Telegram API transport, including
+manually delayed responses, so it does not send real Telegram requests.
 
-The planned v0.2 lifecycle and concurrency hardening is documented in
+The v0.2 lifecycle and concurrency hardening is documented in
 [docs/reliability-plan-0.2.md](docs/reliability-plan-0.2.md).
 
 ## License

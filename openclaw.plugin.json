@@ -40,6 +40,30 @@
         "enum": ["idle", "error", "timeout"],
         "default": "timeout"
       },
+      "idleDebounceMs": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 10000,
+        "default": 600
+      },
+      "telegramRetryAttempts": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 5,
+        "default": 3
+      },
+      "telegramRetryBaseMs": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 30000,
+        "default": 400
+      },
+      "telegramRetryMaxMs": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 30000,
+        "default": 10000
+      },
       "onlyAccountIds": {
         "type": "array",
         "items": {

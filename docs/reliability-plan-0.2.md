@@ -1,6 +1,6 @@
 # Reliability plan for v0.2
 
-Status: design only; no runtime changes are included in this document.
+Status: implemented for v0.2.0.
 
 Reviewed against:
 

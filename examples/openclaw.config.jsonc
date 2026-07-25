@@ -9,6 +9,7 @@
         "config": {
           "botTokenFile": "/path/to/telegram.bot_token",
           "timeoutMs": 1800000,
+          "idleDebounceMs": 600,
           "timeoutState": "timeout",
           "icons": {
             "working": "5309832892262654231",
