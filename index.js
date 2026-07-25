@@ -4,7 +4,7 @@ import http from "node:http";
 import https from "node:https";
 
 const PLUGIN_ID = "openclaw-topic-status";
-const PLUGIN_VERSION = "0.2.1";
+const PLUGIN_VERSION = "0.2.2";
 const SHARED_STATE_KEY = Symbol.for("openclaw-topic-status.runtime-state.v2");
 const DEFAULT_CHANNEL_ID = "telegram";
 const DEFAULT_API_ROOT = "https://api.telegram.org";
@@ -890,6 +890,53 @@ function createRuntime(api, runtimeState = createRuntimeState()) {
     state.idleTimer = setTimeout(finish, config.idleDebounceMs);
   }
 
+  function activateRun(event, ctx, target, source) {
+    const runId = cleanString(ctx?.runId) ?? cleanString(event?.runId);
+    if (!runId) {
+      log.debug(`${source} cached run=legacy reason=missing-runId`);
+      return null;
+    }
+
+    const existing = byRun.get(runId);
+    if (existing) {
+      const state = existing.state;
+      clearIdleTimer(state);
+      scheduleRescue(state);
+      if (state.desiredStatus !== "working") {
+        queueStatus(state, "working", `${source}_duplicate`);
+      }
+      log.debug(
+        `${source} duplicate topic=${state.topicKey} gen=${state.generation} run=${shortRunId(runId)}`,
+      );
+      return state;
+    }
+    completedRuns.delete(runId);
+
+    if (!target) {
+      log.debug(`${source} ignored run=${shortRunId(runId)} reason=topic-unresolved`);
+      return null;
+    }
+    const state = ensureTopic({ ...target, runId });
+    clearIdleTimer(state);
+    const sessionKey =
+      cleanString(ctx?.sessionKey) ?? cleanString(event?.sessionKey) ?? target.sessionKey;
+    state.activeRuns.set(runId, { sessionKey });
+    byRun.set(runId, { state, generation: state.generation, sessionKey });
+    if (sessionKey) {
+      state.sessionKeys.add(sessionKey);
+      const sessionRuns = runsBySession.get(sessionKey) ?? new Set();
+      sessionRuns.add(runId);
+      runsBySession.set(sessionKey, sessionRuns);
+    }
+    targetsByRun.delete(runId);
+    scheduleRescue(state);
+    queueStatus(state, "working", source);
+    log.debug(
+      `${source} topic=${state.topicKey} gen=${state.generation} run=${shortRunId(runId)} active=${state.activeRuns.size}`,
+    );
+    return state;
+  }
+
   function onMessageReceived(event, ctx) {
     if (stopping) {
       return;
@@ -904,6 +951,22 @@ function createRuntime(api, runtimeState = createRuntimeState()) {
     );
   }
 
+  function onModelCallStarted(event, ctx) {
+    if (stopping) {
+      return;
+    }
+    const target = resolveStartTarget(event, ctx);
+    activateRun(event, ctx, target, "model_call_started");
+  }
+
+  function onBeforeAgentStart(event, ctx) {
+    if (stopping) {
+      return;
+    }
+    const target = resolveStartTarget(event, ctx);
+    activateRun(event, ctx, target, "before_agent_start");
+  }
+
   function onBeforeAgentRun(event, ctx) {
     if (stopping) {
       return { outcome: "pass" };
@@ -914,41 +977,8 @@ function createRuntime(api, runtimeState = createRuntimeState()) {
       return { outcome: "pass" };
     }
 
-    const existing = byRun.get(runId);
-    if (existing) {
-      const state = existing.state;
-      clearIdleTimer(state);
-      scheduleRescue(state);
-      queueStatus(state, "working", "before_agent_run_duplicate");
-      log.debug(
-        `before_agent_run duplicate topic=${state.topicKey} gen=${state.generation} run=${shortRunId(runId)}`,
-      );
-      return { outcome: "pass" };
-    }
-    completedRuns.delete(runId);
-
     const target = resolveStartTarget(event, ctx);
-    if (!target) {
-      log.debug(`before_agent_run ignored run=${shortRunId(runId)} reason=topic-unresolved`);
-      return { outcome: "pass" };
-    }
-    const state = ensureTopic({ ...target, runId });
-    clearIdleTimer(state);
-    const sessionKey = cleanString(ctx?.sessionKey) ?? cleanString(event?.sessionKey) ?? target.sessionKey;
-    state.activeRuns.set(runId, { sessionKey });
-    byRun.set(runId, { state, generation: state.generation, sessionKey });
-    if (sessionKey) {
-      state.sessionKeys.add(sessionKey);
-      const sessionRuns = runsBySession.get(sessionKey) ?? new Set();
-      sessionRuns.add(runId);
-      runsBySession.set(sessionKey, sessionRuns);
-    }
-    targetsByRun.delete(runId);
-    scheduleRescue(state);
-    queueStatus(state, "working", "before_agent_run");
-    log.debug(
-      `before_agent_run topic=${state.topicKey} gen=${state.generation} run=${shortRunId(runId)} active=${state.activeRuns.size}`,
-    );
+    activateRun(event, ctx, target, "before_agent_run");
     return { outcome: "pass" };
   }
 
@@ -1092,6 +1122,8 @@ function createRuntime(api, runtimeState = createRuntimeState()) {
 
   return {
     onMessageReceived,
+    onModelCallStarted,
+    onBeforeAgentStart,
     onBeforeAgentRun,
     onMessageSent,
     onAgentEnd,
@@ -1123,6 +1155,8 @@ const entry = {
   register(api) {
     const runtime = createRuntime(api, getSharedRuntimeState());
     api.on("message_received", runtime.onMessageReceived, { priority: 10, timeoutMs: 5_000 });
+    api.on("before_agent_start", runtime.onBeforeAgentStart, { priority: 10, timeoutMs: 5_000 });
+    api.on("model_call_started", runtime.onModelCallStarted, { priority: 10, timeoutMs: 5_000 });
     api.on("before_agent_run", runtime.onBeforeAgentRun, { priority: 10, timeoutMs: 5_000 });
     api.on("message_sent", runtime.onMessageSent, { priority: -10, timeoutMs: 5_000 });
     api.on("agent_end", runtime.onAgentEnd, { priority: -10, timeoutMs: 5_000 });

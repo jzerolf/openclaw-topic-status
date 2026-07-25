@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.2 - 2026-07-25
+
+- Cache the exact Telegram target and `runId` at `message_received`, then use
+  the Codex-compatible `before_agent_start` lifecycle hook as the authoritative
+  start of real agent work.
+- Keep `before_agent_run` and sanitized `model_call_started` as idempotent
+  early start/fallback signals for runtimes that emit them.
+- Cover Codex app-server lifecycle ordering, where `message_received` and
+  `before_agent_start`/`agent_end` are emitted but `before_agent_run` and
+  `model_call_started` may be absent.
+
 ## 0.2.1 - 2026-07-25
 
 - Share topic and run indexes across repeated plugin registrations in the same
