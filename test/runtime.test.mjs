@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createRuntime } from "../index.js";
+import plugin, { createRuntime } from "../index.js";
 
 const CHAT_ID = "5966150195";
 
@@ -261,13 +261,88 @@ test("an unknown runId is ignored even when its topic matches", { concurrency: f
   });
 });
 
-test("agent_end cannot invent idle state in a fresh runtime", { concurrency: false }, async () => {
+test("agent_end can close its exact topic after a runtime rebuild", { concurrency: false }, async () => {
   await usingHarness({}, async ({ runtime, calls }) => {
     end(runtime, 14001, "run-never-seen");
     await runtime._test.waitForWrites();
-    assert.deepEqual(calls, []);
+    assert.deepEqual(icons(calls), ["idle"]);
     assert.equal(runtime._state.byTopic.size, 0);
   });
+});
+
+test("separate plugin registrations share start and terminal state", { concurrency: false }, async () => {
+  const calls = [];
+  globalThis.__telegramTopicStatusPostJson = async (url, body) => {
+    calls.push({ url, body });
+    return successfulResponse();
+  };
+  globalThis.__telegramTopicStatusSleep = async () => {};
+
+  const makeApi = (hooks) => ({
+    pluginConfig: {
+      idleDebounceMs: 0,
+      timeoutMs: 60_000,
+      logLevel: "off",
+      icons: {
+        working: "working",
+        idle: "idle",
+        error: "error",
+        timeout: "timeout",
+      },
+    },
+    config: {
+      channels: {
+        telegram: {
+          botToken: "123456:test-token",
+        },
+      },
+    },
+    logger: {
+      info() {},
+      warn() {},
+    },
+    on(name, handler) {
+      hooks.set(name, handler);
+    },
+  });
+
+  const firstHooks = new Map();
+  const secondHooks = new Map();
+  plugin.register(makeApi(firstHooks));
+  plugin.register(makeApi(secondHooks));
+  try {
+    firstHooks.get("message_received")(
+      {
+        from: `telegram:${CHAT_ID}`,
+        threadId: 14501,
+        sessionKey: sessionKey(14501),
+        runId: "run-split-registry",
+      },
+      {
+        channelId: "telegram",
+        accountId: "default",
+        conversationId: `telegram:${CHAT_ID}`,
+        sessionKey: sessionKey(14501),
+        runId: "run-split-registry",
+      },
+    );
+    firstHooks.get("before_agent_run")(
+      { prompt: "ping", runId: "run-split-registry" },
+      agentContext(14501, "run-split-registry"),
+    );
+    await waitUntil(() => calls.length === 1);
+
+    secondHooks.get("agent_end")(
+      { runId: "run-split-registry", messages: [], success: true },
+      agentContext(14501, "run-split-registry"),
+    );
+    await waitUntil(() => calls.length === 2);
+    assert.deepEqual(icons(calls), ["working", "idle"]);
+  } finally {
+    await secondHooks.get("gateway_stop")({}, {});
+    delete globalThis.__telegramTopicStatusPostJson;
+    delete globalThis.__telegramTopicStatusSleep;
+  }
 });
 
 test("session_end reasons perform bookkeeping without closing active work", { concurrency: false }, async () => {

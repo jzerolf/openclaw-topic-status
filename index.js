@@ -4,7 +4,8 @@ import http from "node:http";
 import https from "node:https";
 
 const PLUGIN_ID = "openclaw-topic-status";
-const PLUGIN_VERSION = "0.2.0";
+const PLUGIN_VERSION = "0.2.1";
+const SHARED_STATE_KEY = Symbol.for("openclaw-topic-status.runtime-state.v2");
 const DEFAULT_CHANNEL_ID = "telegram";
 const DEFAULT_API_ROOT = "https://api.telegram.org";
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
@@ -14,6 +15,8 @@ const DEFAULT_RETRY_BASE_MS = 400;
 const DEFAULT_RETRY_MAX_MS = 10_000;
 const TARGET_CACHE_TTL_MS = 10 * 60 * 1000;
 const TARGET_CACHE_MAX_ENTRIES = 1_000;
+const COMPLETED_RUN_TTL_MS = 10 * 60 * 1000;
+const COMPLETED_RUN_MAX_ENTRIES = 2_000;
 
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -505,14 +508,39 @@ function postJson(url, payload) {
   });
 }
 
-function createRuntime(api) {
+function createRuntimeState() {
+  return {
+    schemaVersion: 2,
+    byTopic: new Map(),
+    byRun: new Map(),
+    runsBySession: new Map(),
+    targetsBySession: new Map(),
+    targetsByRun: new Map(),
+    completedRuns: new Map(),
+  };
+}
+
+function getSharedRuntimeState() {
+  const existing = globalThis[SHARED_STATE_KEY];
+  if (existing?.schemaVersion === 2) {
+    return existing;
+  }
+  const sharedState = createRuntimeState();
+  globalThis[SHARED_STATE_KEY] = sharedState;
+  return sharedState;
+}
+
+function createRuntime(api, runtimeState = createRuntimeState()) {
   const config = normalizeConfig(api.pluginConfig);
   const log = makeLog(api, config);
-  const byTopic = new Map();
-  const byRun = new Map();
-  const runsBySession = new Map();
-  const targetsBySession = new Map();
-  const targetsByRun = new Map();
+  const {
+    byTopic,
+    byRun,
+    runsBySession,
+    targetsBySession,
+    targetsByRun,
+    completedRuns,
+  } = runtimeState;
   let stopping = false;
 
   function createTopicState(target) {
@@ -676,6 +704,15 @@ function createRuntime(api) {
 
   function removeRun(runId, record) {
     byRun.delete(runId);
+    completedRuns.delete(runId);
+    completedRuns.set(runId, Date.now());
+    const completedCutoff = Date.now() - COMPLETED_RUN_TTL_MS;
+    for (const [completedRunId, completedAt] of completedRuns) {
+      if (completedAt >= completedCutoff && completedRuns.size <= COMPLETED_RUN_MAX_ENTRIES) {
+        break;
+      }
+      completedRuns.delete(completedRunId);
+    }
     record.state.activeRuns.delete(runId);
     const sessionKey = record.sessionKey;
     if (sessionKey) {
@@ -797,12 +834,22 @@ function createRuntime(api) {
     return state;
   }
 
-  function activeRecordForTerminal(event, ctx, source) {
+  function activeRecordForTerminal(event, ctx, source, options = {}) {
     const runId = cleanString(ctx?.runId) ?? cleanString(event?.runId);
     if (runId) {
+      const completedAt = completedRuns.get(runId);
+      if (completedAt && completedAt >= Date.now() - COMPLETED_RUN_TTL_MS) {
+        log.debug(`${source} ignored run=${shortRunId(runId)} reason=already-completed`);
+        return null;
+      }
+      if (completedAt) {
+        completedRuns.delete(runId);
+      }
       const record = byRun.get(runId);
       if (!record || record.state.generation !== record.generation) {
-        log.debug(`${source} ignored run=${shortRunId(runId)} reason=unknown-or-stale`);
+        if (!options.deferUnknownLog) {
+          log.debug(`${source} ignored run=${shortRunId(runId)} reason=unknown-or-stale`);
+        }
         return null;
       }
       return { runId, record };
@@ -841,7 +888,6 @@ function createRuntime(api) {
       return;
     }
     state.idleTimer = setTimeout(finish, config.idleDebounceMs);
-    state.idleTimer.unref?.();
   }
 
   function onMessageReceived(event, ctx) {
@@ -879,6 +925,7 @@ function createRuntime(api) {
       );
       return { outcome: "pass" };
     }
+    completedRuns.delete(runId);
 
     const target = resolveStartTarget(event, ctx);
     if (!target) {
@@ -923,8 +970,39 @@ function createRuntime(api) {
     if (stopping) {
       return;
     }
-    const match = activeRecordForTerminal(event, ctx, "agent_end");
+    const match = activeRecordForTerminal(event, ctx, "agent_end", {
+      deferUnknownLog: true,
+    });
     if (!match) {
+      const terminalRunId = cleanString(ctx?.runId) ?? cleanString(event?.runId);
+      const completedAt = terminalRunId ? completedRuns.get(terminalRunId) : undefined;
+      if (completedAt && completedAt >= Date.now() - COMPLETED_RUN_TTL_MS) {
+        return;
+      }
+      const target = resolveTopicState(event, ctx, config);
+      if (!target) {
+        return;
+      }
+      const existing = byTopic.get(target.topicKey);
+      if (existing?.activeRuns.size > 0) {
+        log.debug(
+          `agent_end ignored topic=${target.topicKey} run=${shortRunId(ctx?.runId ?? event?.runId)} reason=unknown-run-with-active-topic`,
+        );
+        return;
+      }
+      if (existing?.terminal) {
+        return;
+      }
+      const state = existing ?? createTopicState(target);
+      if (!existing) {
+        updateTopicTarget(state, target);
+        byTopic.set(target.topicKey, state);
+      }
+      const finalState = event?.success === false ? "error" : "idle";
+      log.debug(
+        `agent_end stateless topic=${target.topicKey} gen=${state.generation} run=${shortRunId(ctx?.runId ?? event?.runId)} final=${finalState}`,
+      );
+      void finalizeGeneration(state, finalState, "agent_end_stateless");
       return;
     }
     const { runId, record } = match;
@@ -985,6 +1063,10 @@ function createRuntime(api) {
     runsBySession.clear();
     targetsBySession.clear();
     targetsByRun.clear();
+    completedRuns.clear();
+    if (globalThis[SHARED_STATE_KEY] === runtimeState) {
+      delete globalThis[SHARED_STATE_KEY];
+    }
   }
 
   async function waitForWrites() {
@@ -1021,6 +1103,7 @@ function createRuntime(api) {
       runsBySession,
       targetsBySession,
       targetsByRun,
+      completedRuns,
     },
     _test: {
       waitForWrites,
@@ -1038,7 +1121,7 @@ const entry = {
   description:
     "Updates Telegram forum topic custom emoji icons from OpenClaw runtime state.",
   register(api) {
-    const runtime = createRuntime(api);
+    const runtime = createRuntime(api, getSharedRuntimeState());
     api.on("message_received", runtime.onMessageReceived, { priority: 10, timeoutMs: 5_000 });
     api.on("before_agent_run", runtime.onBeforeAgentRun, { priority: 10, timeoutMs: 5_000 });
     api.on("message_sent", runtime.onMessageSent, { priority: -10, timeoutMs: 5_000 });

@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 - 2026-07-25
+
+- Share topic and run indexes across repeated plugin registrations in the same
+  OpenClaw process.
+- Allow `agent_end` to apply a stateless terminal transition only when its
+  exact Telegram topic has no known active run.
+- Keep the short idle debounce referenced until it fires so one-shot and
+  rebuilt plugin runtimes cannot exit before applying `idle`.
+- Keep bounded, expiring completed-run tombstones so duplicate late terminal
+  events cannot create a second stateless write.
+- Add regression coverage for split start/end registries and the real
+  untracked terminal-hook shape.
+
 ## 0.2.0 - 2026-07-25
 
 - Make exact OpenClaw `runId` correlation authoritative for terminal events.
