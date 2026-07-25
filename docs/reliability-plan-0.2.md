@@ -1,7 +1,11 @@
-# Reliability plan for v0.2
+# Reliability design and implementation record for v0.2
 
 Status: implemented for v0.2.0, with cross-registration terminal handling
 hardened in v0.2.1 and Codex harness activation added in v0.2.2.
+
+This document preserves the diagnosis and design decisions behind the v0.2
+series. The required changes are no longer pending: they shipped across
+v0.2.0-v0.2.2 and are covered by the current test suite.
 
 Reviewed against:
 
@@ -9,9 +13,10 @@ Reviewed against:
 - OpenClaw 2026.7.1
 - OpenClaw's current plugin hook, Codex harness, and Telegram ingress contracts
 
-## Verdict
+## Verdict (resolved)
 
-The plugin needs a state-management hardening pass before its next release.
+The plugin needed a state-management hardening pass after v0.1.1. That work
+shipped in v0.2.0-v0.2.2.
 
 The reported `working -> idle` jump cannot be safely attributed to the
 `editForumTopic` call being treated as an agent reply:
@@ -22,30 +27,31 @@ The reported `working -> idle` jump cannot be safely attributed to the
   an icon-only service message has no agent body and is discarded before agent
   dispatch.
 
-The stronger failure candidates are inside the plugin:
+The stronger failure candidates were inside the v0.1.1 plugin:
 
-1. Terminal events use permissive fallback correlation. An unknown or stale
-   `agent_end` can fall through from `runId` to the current `sessionKey` or
+1. Terminal events used permissive fallback correlation. An unknown or stale
+   `agent_end` could fall through from `runId` to the current `sessionKey` or
    sender record and close a newer run in the same topic.
-2. `working`, `idle`, `error`, and `timeout` writes are launched without a
-   per-topic queue. OpenClaw explicitly allows observation hooks to overlap, so
-   Telegram requests can be in flight concurrently and finish out of order.
-3. `session_end` is treated as a normal turn-completion signal even though it
+2. `working`, `idle`, `error`, and `timeout` writes were launched without a
+   per-topic queue. Because OpenClaw allows observation hooks to overlap,
+   Telegram requests could finish out of order.
+3. `session_end` was treated as a normal turn-completion signal even though it
    describes session lifecycle, not agent-run completion, and does not provide
    the same exact run correlation.
-4. The current test suite uses an immediately resolving fake transport, so it
-   cannot expose ordering races.
+4. The test suite used an immediately resolving fake transport, so it could
+   not expose ordering races.
 
-The exact historical event that caused each visible jump is not recoverable
-with the current `info` logging: transition sources, run correlation, and
-Telegram request ordering are not recorded. The implementation should add safe
-diagnostic logging so future reports are attributable.
+The exact historical event that caused each visible jump was not recoverable
+from the v0.1.1 `info` logging. The v0.2 series added safe debug diagnostics
+for transition sources, run correlation, and Telegram request ordering.
 
 ## Current contract that matters
 
 OpenClaw 2026.7.1 documents and implements these guarantees:
 
 - `message_received` is an observation hook and may run fire-and-forget.
+- `before_agent_start` is available to external plugins on the Codex harness
+  path and may be emitted even when `before_agent_run` is absent.
 - `before_agent_run` runs after prompt construction and before model input.
 - `agent_end` is the terminal observation hook for one end-to-end agent turn.
 - `runId` is unique to that turn and remains stable through model retries,
@@ -67,11 +73,12 @@ References:
 - <https://github.com/openclaw/openclaw/blob/main/extensions/telegram/src/forum-service-message.ts>
 - <https://github.com/openclaw/openclaw/blob/main/extensions/telegram/src/bot-message-context.body.ts>
 
-## Required implementation changes
+## Implemented reliability changes
 
 ### P0: make `runId` authoritative for terminal events
 
-Split the current general-purpose `lookup()` into event-specific resolution:
+The implementation split the v0.1.1 general-purpose `lookup()` into
+event-specific resolution:
 
 - start/resume events may resolve a Telegram target from typed context and
   `sessionKey`;
@@ -103,10 +110,10 @@ TopicState
   serialized writer
 ```
 
-Rules:
+Implemented rules:
 
-- `before_agent_run` adds the exact `runId`, cancels pending idle, and requests
-  `working`;
+- `before_agent_start` adds the exact `runId`, cancels pending idle, and
+  requests `working`; `before_agent_run` remains an idempotent fallback;
 - duplicate events for the same `runId` are idempotent;
 - `agent_end` removes only its own `runId`;
 - successful completion requests `idle` only when no active runs remain;
@@ -201,7 +208,7 @@ When the rescue timer fires:
 - clear run, session, sender, timer, and topic indexes after the final write
   settles or after bounded retry exhaustion.
 
-Current cleanup issues to remove:
+The v0.1.1 cleanup issues addressed here were:
 
 - `completedTopicSeq` grows by one entry per completed run;
 - fired timers remain referenced in `timeoutByTopic`;
@@ -247,59 +254,47 @@ Never log message content, bot tokens, token-file contents, or full secrets.
 
 At info level, log plugin startup/version and terminal Telegram failures only.
 
-## Test plan
+## Implemented test coverage
 
-Replace the single happy-path smoke sequence with focused state-machine tests.
-At minimum:
+The current suite contains 19 focused state-machine tests covering:
 
-1. `before_agent_run -> agent_end` produces `working -> idle`.
-2. A stale `agent_end(run-A)` arriving after `before_agent_run(run-B)` does
-   not set idle.
-3. Two overlapping runs in one topic remain working until both end.
-4. Two topics used by the same sender never share state.
-5. Duplicate `message_received`/`before_agent_run` events for one `runId` do
-   not duplicate Telegram writes.
-6. An unknown terminal `runId` cannot close a known active topic; a rebuilt
-   registry may close only the exact stateless Telegram topic in its context.
-7. A `session_end(idle|compaction|reset)` cannot close a current active run.
-8. Delayed fake HTTP responses cannot reorder the final applied status.
-9. A new run during the idle debounce cancels idle.
-10. Timeout transitions clean all indexes and timers.
-11. A transient Telegram failure retries in order and preserves the newest
-    desired state.
-12. `gateway_stop` cannot finish with an older queued `working` write.
+- the Codex `before_agent_start -> agent_end` lifecycle and the legacy
+  `before_agent_run` fallback;
+- stale, unknown, duplicate, overlapping, and ambiguous run correlation;
+- isolation between topics used by the same sender;
+- shared state and exact stateless terminal handling across rebuilt plugin
+  registrations;
+- `session_end` bookkeeping without premature completion;
+- adversarial Telegram response ordering, idle debounce cancellation, and
+  serialized generations;
+- terminal timeout cleanup, transient retries, and Bot API errors returned
+  with HTTP 200;
+- `gateway_stop` winning over older queued writes.
 
-The fake transport must support manually controlled promises so tests can
-complete requests in adversarial order.
+The fake transport supports manually controlled promises so tests can complete
+requests in adversarial order.
 
 ## Compatibility and release
 
-The current package declares OpenClaw `>=2026.5.27`, but the reliable design
-should use the current exact `runId` contract. For v0.2, choose one of:
+The v0.2 series chose the stricter compatibility path:
 
-- recommended: raise `peerDependencies.openclaw` and
-  `minGatewayVersion` to `>=2026.7.1`;
-- alternative: retain older support but make all missing/ambiguous terminal
-  correlation fail safe and cover that legacy path with separate tests.
+- `peerDependencies.openclaw` is `>=2026.7.1`;
+- `openclaw.compat.pluginApi` is `>=2026.7.1`;
+- `openclaw.compat.minGatewayVersion` is `2026.7.1`.
 
 Reliability is more valuable here than preserving broad compatibility with
 older hook behavior. The state and lifecycle redesign shipped as v0.2.0, the
 cross-registration terminal fix as v0.2.1, and Codex harness activation as
 v0.2.2.
 
-## Rollout checklist
+## Rollout result
 
-1. Implement the state machine and tests on a feature branch.
-2. Run `npm test` and `npm run pack:dry-run`.
-3. Review the diff for token/content logging.
-4. Enable debug logging only for a short controlled validation window.
-5. Install/link the reviewed version.
-6. Restart the Gateway once, during the agreed maintenance window.
-7. Test:
-   - a normal short answer;
-   - a long tool-using answer with commentary;
-   - two quick consecutive messages in one topic;
-   - activity in two topics by the same sender;
-   - an induced failed run if a safe test path is available.
-8. Return logging to `info`.
-9. Publish the current release only after the live sequence remains stable.
+- The state machine and focused tests shipped across v0.2.0-v0.2.2.
+- `npm test` passes all 19 tests.
+- `npm run pack:dry-run` validates the release contents.
+- Logging was reviewed to exclude tokens and message content.
+- v0.2.2 was installed and validated with a real Telegram
+  `working -> idle` cycle.
+- Normal operation uses `info` logging.
+- v0.2.2 is published as the latest GitHub release:
+  <https://github.com/jzerolf/openclaw-topic-status/releases/tag/v0.2.2>.
